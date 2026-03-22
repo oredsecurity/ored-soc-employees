@@ -54,6 +54,7 @@ from wazuh_mcp_server.security import (
     validate_username,
 )
 from wazuh_mcp_server.session_store import SessionStore, create_session_store
+from wazuh_mcp_server.ored_audit import OREDAuditMiddleware
 
 # MCP Protocol Version Support
 # Latest: 2025-11-25, also supports backwards compatibility with older versions
@@ -638,6 +639,9 @@ app.add_middleware(
     expose_headers=["MCP-Session-Id", "MCP-Protocol-Version", "Content-Type"],
     max_age=CORS_MAX_AGE_SECONDS,
 )
+
+# ORED Audit & Hardening Layer — logs all tool calls, blocks forbidden actions
+app.add_middleware(OREDAuditMiddleware)
 
 # MCP Protocol Error Codes
 MCP_ERRORS = {

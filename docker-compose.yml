@@ -1,0 +1,108 @@
+version: "3.8"
+
+# ORED AI SOC Employees — Docker Compose Stack
+# https://github.com/oredsecurity/hermes-soc-employees
+#
+# Prerequisites:
+#   - A running Wazuh instance (manager + API accessible)
+#   - Docker & Docker Compose installed
+#   - .env file configured (copy from .env.example)
+#
+# Usage:
+#   cp .env.example .env
+#   # Edit .env with your Wazuh credentials and API keys
+#   docker compose up -d
+
+services:
+  # ─────────────────────────────────────────────
+  # Wazuh MCP Server (forked + ORED hardening)
+  # Exposes 48+ Wazuh tools via MCP protocol
+  # ─────────────────────────────────────────────
+  wazuh-mcp-server:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    container_name: ored-wazuh-mcp
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-3000}:3000"
+    environment:
+      # Wazuh API connection
+      - WAZUH_HOST=${WAZUH_HOST}
+      - WAZUH_PORT=${WAZUH_PORT:-55000}
+      - WAZUH_USER=${WAZUH_USER}
+      - WAZUH_PASS=${WAZUH_PASS}
+      - WAZUH_VERIFY_SSL=${WAZUH_VERIFY_SSL:-false}
+      # MCP server config
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=3000
+      - AUTH_MODE=${MCP_AUTH_MODE:-none}
+      - AUTH_SECRET_KEY=${MCP_AUTH_SECRET:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Wazuh Indexer (optional, for vuln tools on Wazuh 4.8+)
+      - WAZUH_INDEXER_HOST=${WAZUH_INDEXER_HOST:-}
+      - WAZUH_INDEXER_PORT=${WAZUH_INDEXER_PORT:-9200}
+      - WAZUH_INDEXER_USER=${WAZUH_INDEXER_USER:-}
+      - WAZUH_INDEXER_PASS=${WAZUH_INDEXER_PASS:-}
+    networks:
+      - ored-soc
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  # ─────────────────────────────────────────────
+  # Hermes Agent (the SOC employee brain)
+  # Connects to MCP server, processes alerts,
+  # requests approvals, takes action
+  # ─────────────────────────────────────────────
+  hermes-agent:
+    build:
+      context: ./hermes
+      dockerfile: Dockerfile
+    container_name: ored-hermes-agent
+    restart: unless-stopped
+    depends_on:
+      wazuh-mcp-server:
+        condition: service_healthy
+    environment:
+      # LLM backend
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      # Telegram approval interface
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      # Internal networking
+      - MCP_SERVER_URL=http://wazuh-mcp-server:3000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Persistent memory and skills (survive container restarts)
+      - hermes-data:/root/.hermes
+      # Mount custom skills
+      - ./hermes/skills:/root/.hermes/skills/ored-soc:ro
+      # Mount custom config
+      - ./hermes/config/config.yaml:/root/.hermes/config.yaml:ro
+      - ./hermes/config/SOUL.md:/root/.hermes/SOUL.md:ro
+    networks:
+      - ored-soc
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+
+networks:
+  ored-soc:
+    name: ored-soc-network
+    driver: bridge
+
+volumes:
+  hermes-data:
+    name: ored-hermes-data

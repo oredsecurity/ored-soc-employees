@@ -1,0 +1,8 @@
+# ORED SOC Employee — Hermes Agent Configuration
+# This file configures the Hermes Agent to connect to the Wazuh MCP Server
+
+mcp_servers:
+  wazuh:
+    url: "${MCP_SERVER_URL:-http://wazuh-mcp-server:3000}"
+    timeout: 120
+    connect_timeout: 30

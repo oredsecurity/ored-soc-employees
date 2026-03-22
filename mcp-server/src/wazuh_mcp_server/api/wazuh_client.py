@@ -1,0 +1,1218 @@
+"""Wazuh API client optimized for Wazuh 4.8.0 to 4.14.1 compatibility with latest features."""
+
+import asyncio
+import json
+import logging
+import time
+from collections import OrderedDict, deque
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
+import httpx
+
+from wazuh_mcp_server.api.wazuh_indexer import IndexerNotConfiguredError, WazuhIndexerClient
+from wazuh_mcp_server.config import WazuhConfig
+from wazuh_mcp_server.resilience import CircuitBreaker, CircuitBreakerConfig, RetryConfig
+
+logger = logging.getLogger(__name__)
+
+# Time range to hours mapping for indexer-based queries
+_TIME_RANGE_HOURS = {"1h": 1, "6h": 6, "12h": 12, "1d": 24, "24h": 24, "7d": 168, "30d": 720}
+
+
+def _dict_contains_text(d: Any, text: str) -> bool:
+    """Recursively check if any string value in a dict/list contains the given text.
+    Much faster than json.dumps() + string search for large nested dicts."""
+    if isinstance(d, dict):
+        for v in d.values():
+            if _dict_contains_text(v, text):
+                return True
+    elif isinstance(d, (list, tuple)):
+        for item in d:
+            if _dict_contains_text(item, text):
+                return True
+    elif isinstance(d, str):
+        if text in d.lower():
+            return True
+    elif isinstance(d, (int, float)):
+        if text in str(d):
+            return True
+    return False
+
+
+class WazuhClient:
+    """Simplified Wazuh API client with rate limiting, circuit breaker, and retry logic."""
+
+    def __init__(self, config: WazuhConfig):
+        self.config = config
+        self.token: Optional[str] = None
+        self.client: Optional[httpx.AsyncClient] = None
+        # Lock to prevent concurrent re-authentication races
+        self._auth_lock = asyncio.Lock()
+        # Rate limiting with O(1) deque operations
+        self._rate_limiter = asyncio.Semaphore(config.max_connections)
+        self._request_times: deque = deque(maxlen=200)  # Pre-sized deque for efficiency
+        self._max_requests_per_minute = getattr(config, "max_requests_per_minute", 100)
+        self._rate_limit_enabled = True
+        # Response caching for static data (bounded OrderedDict for O(1) eviction)
+        self._cache: OrderedDict[str, Tuple[float, Dict[str, Any]]] = OrderedDict()
+        self._cache_ttl = 300  # 5 minutes for static data
+        self._cache_max_size = 100
+
+        # Circuit breaker for API resilience — only trip on connection/server errors,
+        # not on user-input errors (ValueError) which shouldn't degrade the circuit
+        circuit_config = CircuitBreakerConfig(
+            failure_threshold=5,
+            recovery_timeout=60,
+            expected_exception=(ConnectionError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError),
+        )
+        self._circuit_breaker = CircuitBreaker(circuit_config)
+
+        # Initialize Wazuh Indexer client if configured (required for Wazuh 4.8.0+)
+        self._indexer_client: Optional[WazuhIndexerClient] = None
+        if config.wazuh_indexer_host:
+            self._indexer_client = WazuhIndexerClient(
+                host=config.wazuh_indexer_host,
+                port=config.wazuh_indexer_port,
+                username=config.wazuh_indexer_user,
+                password=config.wazuh_indexer_pass,
+                verify_ssl=config.verify_ssl,
+                timeout=config.request_timeout_seconds,
+            )
+            logger.info(f"WazuhIndexerClient configured for {config.wazuh_indexer_host}:{config.wazuh_indexer_port}")
+        else:
+            logger.warning(
+                "Wazuh Indexer not configured. Vulnerability tools will not work with Wazuh 4.8.0+. "
+                "Set WAZUH_INDEXER_HOST to enable vulnerability queries."
+            )
+
+        logger.info("WazuhClient initialized with circuit breaker and retry logic")
+
+    async def initialize(self):
+        """Initialize the HTTP client and authenticate."""
+        self.client = httpx.AsyncClient(
+            verify=self.config.verify_ssl,
+            timeout=self.config.request_timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=self.config.max_connections,
+                max_keepalive_connections=max(5, self.config.max_connections // 2),
+            ),
+        )
+        await self._authenticate()
+
+        # Initialize indexer client if configured
+        if self._indexer_client:
+            try:
+                await self._indexer_client.initialize()
+                logger.info("Wazuh Indexer client initialized successfully")
+            except Exception as e:
+                logger.warning(f"Wazuh Indexer initialization failed: {e}")
+
+    async def _authenticate(self):
+        """Authenticate with Wazuh API."""
+        auth_url = f"{self.config.base_url}/security/user/authenticate"
+
+        try:
+            response = await self.client.post(auth_url, auth=(self.config.wazuh_user, self.config.wazuh_pass))
+            response.raise_for_status()
+
+            try:
+                data = response.json()
+            except (json.JSONDecodeError, ValueError):
+                raise ValueError("Invalid JSON in authentication response from Wazuh API")
+            if "data" not in data or "token" not in data["data"]:
+                raise ValueError("Invalid authentication response from Wazuh API")
+
+            self.token = data["data"]["token"]
+            logger.info(f"Authenticated with Wazuh server at {self.config.wazuh_host}")
+
+        except httpx.ConnectError:
+            raise ConnectionError(
+                f"Cannot connect to Wazuh server at {self.config.wazuh_host}:{self.config.wazuh_port}"
+            )
+        except httpx.TimeoutException:
+            raise ConnectionError(f"Connection timeout to Wazuh server at {self.config.wazuh_host}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                raise ValueError("Invalid Wazuh credentials. Check WAZUH_USER and WAZUH_PASS")
+            elif e.response.status_code == 403:
+                raise ValueError("Wazuh user does not have sufficient permissions")
+            else:
+                raise ValueError(f"Wazuh API error: {e.response.status_code} - {e.response.text}")
+
+    async def get_alerts(self, **params) -> Dict[str, Any]:
+        """
+        Get alerts from the Wazuh Indexer (wazuh-alerts-* index).
+
+        Alerts are stored in the Wazuh Indexer, not the Manager API.
+        The Manager API does not have a /alerts endpoint.
+
+        Raises:
+            IndexerNotConfiguredError: If Wazuh Indexer is not configured
+        """
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError(
+                "Wazuh Indexer not configured. "
+                "Alerts are stored in the Wazuh Indexer and require WAZUH_INDEXER_HOST to be set.\n\n"
+                "Please set the following environment variables:\n"
+                "  WAZUH_INDEXER_HOST=<indexer_hostname>\n"
+                "  WAZUH_INDEXER_USER=<indexer_username>\n"
+                "  WAZUH_INDEXER_PASS=<indexer_password>\n"
+                "  WAZUH_INDEXER_PORT=9200 (optional, default: 9200)"
+            )
+
+        return await self._indexer_client.get_alerts(
+            limit=params.get("limit", 100),
+            rule_id=params.get("rule_id"),
+            level=params.get("level"),
+            agent_id=params.get("agent_id"),
+            timestamp_start=params.get("timestamp_start"),
+            timestamp_end=params.get("timestamp_end"),
+        )
+
+    async def get_agents(self, agent_id=None, status=None, limit=100, **params) -> Dict[str, Any]:
+        """Get agents from Wazuh."""
+        clean_params: Dict[str, Any] = {}
+        if agent_id:
+            clean_params["agents_list"] = agent_id
+        if status:
+            clean_params["status"] = status
+        if limit:
+            clean_params["limit"] = limit
+        for k, v in params.items():
+            if v is not None:
+                clean_params[k] = v
+        return await self._request("GET", "/agents", params=clean_params)
+
+    async def get_vulnerabilities(self, **params) -> Dict[str, Any]:
+        """
+        Get vulnerabilities from Wazuh Indexer (4.8.0+ required).
+
+        Note: The /vulnerability API endpoint was deprecated in Wazuh 4.7.0
+        and removed in 4.8.0. Vulnerability data must be queried from the
+        Wazuh Indexer using the wazuh-states-vulnerabilities-* index.
+
+        Args:
+            agent_id: Filter by agent ID
+            severity: Filter by severity (critical, high, medium, low)
+            limit: Maximum number of results (default: 100)
+
+        Returns:
+            Vulnerability data from the indexer
+
+        Raises:
+            IndexerNotConfiguredError: If Wazuh Indexer is not configured
+        """
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+
+        agent_id = params.get("agent_id")
+        severity = params.get("severity")
+        limit = params.get("limit", 100)
+
+        return await self._indexer_client.get_vulnerabilities(agent_id=agent_id, severity=severity, limit=limit)
+
+    async def get_cluster_status(self) -> Dict[str, Any]:
+        """Get cluster status."""
+        return await self._request("GET", "/cluster/status")
+
+    async def search_logs(self, **params) -> Dict[str, Any]:
+        """Search logs with advanced filtering capabilities."""
+        return await self._request("GET", "/manager/logs", params=params)
+
+    async def _get_cached(self, cache_key: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """
+        Get data from cache or fetch from API.
+
+        Args:
+            cache_key: Unique cache key for this request
+            endpoint: API endpoint
+            **kwargs: Additional request parameters
+
+        Returns:
+            Cached or fresh API response
+        """
+        from wazuh_mcp_server.monitoring import record_cache_access
+
+        current_time = time.time()
+
+        # Check cache
+        if cache_key in self._cache:
+            cached_time, cached_data = self._cache[cache_key]
+            if current_time - cached_time < self._cache_ttl:
+                record_cache_access("wazuh_api", hit=True)
+                self._cache.move_to_end(cache_key)  # LRU: mark as recently used
+                return cached_data
+
+        record_cache_access("wazuh_api", hit=False)
+
+        # Fetch from API
+        result = await self._request("GET", endpoint, **kwargs)
+
+        # Cache the result, evicting oldest if at capacity (O(1) eviction)
+        self._cache[cache_key] = (current_time, result)
+        if len(self._cache) > self._cache_max_size:
+            self._cache.popitem(last=False)
+
+        return result
+
+    async def get_rules(self, **params) -> Dict[str, Any]:
+        """Get Wazuh detection rules (cached for 5 minutes)."""
+        # Use caching for rules as they rarely change
+        cache_key = f"rules:{sorted(params.items()) if params else 'all'}"
+        return await self._get_cached(cache_key, "/rules", params=params)
+
+    async def get_rule_info(self, rule_id: str) -> Dict[str, Any]:
+        """Get detailed information about a specific rule."""
+        return await self._request("GET", f"/rules/{rule_id}")
+
+    async def get_decoders(self, **params) -> Dict[str, Any]:
+        """Get Wazuh log decoders (cached for 5 minutes)."""
+        # Use caching for decoders as they rarely change
+        cache_key = f"decoders:{sorted(params.items()) if params else 'all'}"
+        return await self._get_cached(cache_key, "/decoders", params=params)
+
+    async def execute_active_response(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute active response command on agents (4.8+ removed 'custom' parameter)."""
+        # Note: 'custom' parameter was removed in Wazuh 4.8.0
+        # Ensure data dict doesn't contain deprecated 'custom' parameter
+        if "custom" in data:
+            data = {k: v for k, v in data.items() if k != "custom"}
+        # Wazuh 4.x API: agent_list must be passed as query param 'agents_list', not in body
+        # Omit agents_list entirely to target all agents (Wazuh rejects "all" as non-numeric)
+        agents_list = data.pop("agent_list", None)
+        params = {}
+        if agents_list:
+            # Filter out "all" — Wazuh 4.x requires numeric agent IDs only
+            numeric_agents = [str(a) for a in (agents_list if isinstance(agents_list, list) else [agents_list]) if str(a) != "all"]
+            if numeric_agents:
+                params["agents_list"] = ",".join(numeric_agents)
+            # If only "all" was specified, omit agents_list to target all agents
+        result = await self._request("PUT", "/active-response", json=data, params=params)
+
+        # Check for partial/total failures in the response body
+        # Wazuh returns HTTP 200 even when the command fails on all agents
+        resp_data = result.get("data", {})
+        total_affected = resp_data.get("total_affected_items", 0)
+        total_failed = resp_data.get("total_failed_items", 0)
+        failed_items = resp_data.get("failed_items", [])
+
+        if total_affected == 0 and total_failed > 0:
+            # Build error details from failed_items
+            errors = []
+            for item in failed_items:
+                err = item.get("error", {})
+                agent_ids = item.get("id", [])
+                errors.append(
+                    f"agents {agent_ids}: code {err.get('code')} - {err.get('message', 'unknown error')}"
+                )
+            error_detail = "; ".join(errors) if errors else "no agents affected"
+            raise ValueError(
+                f"Active response command failed on all agents "
+                f"(0 succeeded, {total_failed} failed): {error_detail}"
+            )
+
+        # Log partial failures as warnings but still return success
+        if total_failed > 0 and total_affected > 0:
+            for item in failed_items:
+                err = item.get("error", {})
+                agent_ids = item.get("id", [])
+                logger.warning(
+                    f"Active response partially failed on agents {agent_ids}: "
+                    f"code {err.get('code')} - {err.get('message')}"
+                )
+
+        return result
+
+    async def get_active_response_commands(self, **params) -> Dict[str, Any]:
+        """Get available active response commands."""
+        return await self._request("GET", "/manager/configuration", params={"section": "active-response"})
+
+    async def get_cdb_lists(self, **params) -> Dict[str, Any]:
+        """Get CDB lists."""
+        return await self._request("GET", "/lists", params=params)
+
+    async def get_cdb_list_content(self, filename: str) -> Dict[str, Any]:
+        """Get specific CDB list content."""
+        return await self._request("GET", f"/lists/{filename}")
+
+    async def get_fim_events(self, **params) -> Dict[str, Any]:
+        """Get File Integrity Monitoring events."""
+        return await self._request("GET", "/syscheck", params=params)
+
+    async def get_syscollector_info(self, agent_id: str, **params) -> Dict[str, Any]:
+        """Get system inventory information from agent."""
+        return await self._request("GET", f"/syscollector/{agent_id}", params=params)
+
+    async def get_manager_stats(self, **params) -> Dict[str, Any]:
+        """Get manager statistics."""
+        return await self._request("GET", "/manager/stats", params=params)
+
+    async def get_cti_data(self, cve_id: str) -> Dict[str, Any]:
+        """
+        Get Cyber Threat Intelligence data for CVE (4.8.0+ via Indexer).
+
+        Note: CTI data is now stored in the Wazuh Indexer.
+
+        Args:
+            cve_id: CVE ID to look up (e.g., "CVE-2021-44228")
+
+        Returns:
+            Vulnerability data for the specific CVE
+
+        Raises:
+            IndexerNotConfiguredError: If Wazuh Indexer is not configured
+        """
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+
+        return await self._indexer_client.get_vulnerabilities(cve_id=cve_id, limit=100)
+
+    async def get_vulnerability_details(self, vuln_id: str, **params) -> Dict[str, Any]:
+        """
+        Get detailed vulnerability information (4.8.0+ via Indexer).
+
+        Note: Vulnerability details are now stored in the Wazuh Indexer.
+
+        Args:
+            vuln_id: Vulnerability/CVE ID
+
+        Returns:
+            Detailed vulnerability information
+
+        Raises:
+            IndexerNotConfiguredError: If Wazuh Indexer is not configured
+        """
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+
+        return await self._indexer_client.get_vulnerabilities(cve_id=vuln_id, limit=1)
+
+    async def get_agent_stats(self, agent_id: str, component: str = "logcollector") -> Dict[str, Any]:
+        """Get agent component statistics."""
+        # Audit fix H6: Validate agent_id is numeric to prevent path traversal
+        if not agent_id or not str(agent_id).isdigit():
+            raise ValueError(f"agent_id must be numeric, got: {agent_id}")
+        # Audit fix: Validate component to prevent path traversal
+        if not component.isalnum():
+            raise ValueError(f"component must be alphanumeric, got: {component}")
+        return await self._request("GET", f"/agents/{agent_id}/stats/{component}")
+
+    async def _rate_limit_check(self) -> None:
+        """Check and enforce rate limiting using efficient O(1) deque operations."""
+        current_time = time.time()
+
+        # Remove requests older than 1 minute from front of deque (O(1) per removal)
+        while self._request_times and current_time - self._request_times[0] >= 60:
+            self._request_times.popleft()
+
+        # Check if we're hitting the rate limit
+        if len(self._request_times) >= self._max_requests_per_minute:
+            # Calculate how long to wait before the oldest request expires
+            oldest_request_time = self._request_times[0]
+            sleep_time = 60 - (current_time - oldest_request_time)
+
+            if sleep_time > 0:
+                logger.warning(
+                    f"Rate limit reached ({self._max_requests_per_minute}/min). Waiting {sleep_time:.1f}s..."
+                )
+                await asyncio.sleep(sleep_time)
+
+                # Clean up expired requests after waiting
+                current_time = time.time()
+                while self._request_times and current_time - self._request_times[0] >= 60:
+                    self._request_times.popleft()
+
+        # Record this request time (O(1) append)
+        self._request_times.append(current_time)
+
+    async def _request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Make authenticated request to Wazuh API with rate limiting, circuit breaker, and retry logic.
+
+        GET requests use retry + circuit breaker. PUT/DELETE requests use circuit breaker
+        only (no retry) because active response commands are not idempotent — retrying a
+        PUT that already executed could double-isolate an agent or double-block an IP.
+        """
+        # Apply rate limiting
+        async with self._rate_limiter:
+            await self._rate_limit_check()
+
+            if method.upper() in ("PUT", "DELETE"):
+                # Non-idempotent: circuit breaker only, no retry
+                return await self._request_no_retry(method, endpoint, **kwargs)
+            # Idempotent (GET, POST for auth): retry + circuit breaker
+            return await self._request_with_resilience(method, endpoint, **kwargs)
+
+    @RetryConfig.WAZUH_API_RETRY
+    async def _request_with_resilience(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Execute request with circuit breaker and retry logic (idempotent methods only)."""
+        return await self._circuit_breaker._call(self._execute_request, method, endpoint, **kwargs)
+
+    async def _request_no_retry(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Execute request with circuit breaker but NO retry (non-idempotent methods)."""
+        return await self._circuit_breaker._call(self._execute_request, method, endpoint, **kwargs)
+
+    async def _execute_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Execute the actual HTTP request to Wazuh API."""
+        # Ensure client is initialized
+        if not self.client:
+            await self.initialize()
+        elif not self.token:
+            await self._authenticate()
+
+        url = f"{self.config.base_url}{endpoint}"
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        try:
+            response = await self.client.request(method, url, headers=headers, **kwargs)
+            response.raise_for_status()
+
+            try:
+                data = response.json()
+            except (json.JSONDecodeError, ValueError):
+                raise ValueError(f"Invalid JSON response from Wazuh API: {endpoint}")
+
+            # Validate response structure
+            if "data" not in data:
+                raise ValueError(f"Invalid response structure from Wazuh API: {endpoint}")
+
+            return data
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                # Token expired -- re-authenticate with lock to prevent concurrent races
+                stale_token = headers.get("Authorization", "").replace("Bearer ", "")
+                async with self._auth_lock:
+                    # Double-check: another coroutine may have already refreshed
+                    if self.token is None or self.token == stale_token:
+                        self.token = None
+                        await self._authenticate()
+                # Retry the request once with refreshed token
+                headers = {"Authorization": f"Bearer {self.token}"}
+                try:
+                    response = await self.client.request(method, url, headers=headers, **kwargs)
+                    response.raise_for_status()
+                    try:
+                        return response.json()
+                    except (json.JSONDecodeError, ValueError):
+                        raise ValueError(f"Invalid JSON response from Wazuh API after re-auth: {endpoint}")
+                except httpx.HTTPStatusError as retry_err:
+                    logger.error(f"Wazuh API request failed after re-auth: {retry_err.response.status_code}")
+                    raise ValueError(
+                        f"Wazuh API error after re-auth for {endpoint}: {retry_err.response.status_code}"
+                    )
+                except (httpx.ConnectError, httpx.TimeoutException) as retry_err:
+                    logger.error(f"Connection lost during re-auth retry for {endpoint}: {retry_err}")
+                    raise
+            elif e.response.status_code == 429:
+                # Wazuh-side rate limiting: wait per Retry-After and let retry logic handle it
+                retry_after = int(e.response.headers.get("Retry-After", "30"))
+                logger.warning(f"Wazuh API rate-limited on {endpoint}. Waiting {retry_after}s...")
+                await asyncio.sleep(min(retry_after, 60))  # Cap at 60s to prevent abuse
+                raise  # Let tenacity/circuit breaker handle the retry
+            elif e.response.status_code >= 500:
+                # Server errors: let them propagate as httpx exceptions so tenacity
+                # retry logic can see them and retry (via _is_retryable)
+                logger.error(f"Wazuh API server error: {e.response.status_code}")
+                raise
+            else:
+                # Client errors (4xx except 401): not retryable, wrap as ValueError
+                logger.error(f"Wazuh API request failed: {endpoint} returned HTTP {e.response.status_code}")
+                raise ValueError(f"Wazuh API request failed: {endpoint} returned HTTP {e.response.status_code}")
+        except httpx.ConnectError as e:
+            # Distinguish SSL errors from generic connection failures
+            err_str = str(e).lower()
+            if "ssl" in err_str or "certificate" in err_str or "verify" in err_str:
+                logger.error(f"SSL certificate validation failed for {self.config.wazuh_host}")
+                raise ConnectionError(
+                    f"SSL certificate validation failed for {self.config.wazuh_host}. "
+                    "Set WAZUH_VERIFY_SSL=false for self-signed certificates."
+                )
+            # Let other connection errors propagate for retry logic
+            logger.error(f"Lost connection to Wazuh server at {self.config.wazuh_host}")
+            raise
+        except httpx.TimeoutException:
+            # Let timeout errors propagate for retry logic
+            logger.error("Request timeout to Wazuh server")
+            raise
+
+    async def get_manager_info(self) -> Dict[str, Any]:
+        """Get Wazuh manager information (cached for 5 minutes)."""
+        cache_key = "manager_info"
+        return await self._get_cached(cache_key, "/")
+
+    def _time_range_to_start(self, time_range: str) -> str:
+        """Convert a time_range string like '24h' or '7d' to an ISO 8601 start timestamp."""
+        hours = _TIME_RANGE_HOURS.get(time_range, 24)
+        return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    async def get_alert_summary(self, time_range: str, group_by: str) -> Dict[str, Any]:
+        """Get alert summary — aggregated from Wazuh Indexer."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        start = self._time_range_to_start(time_range)
+        result = await self._indexer_client.get_alerts(limit=1000, timestamp_start=start)
+        alerts = result.get("data", {}).get("affected_items", [])
+        groups: Dict[str, int] = {}
+        for alert in alerts:
+            value: Any = alert
+            for part in group_by.split("."):
+                value = value.get(part, {}) if isinstance(value, dict) else "unknown"
+            key = str(value) if not isinstance(value, dict) else "unknown"
+            groups[key] = groups.get(key, 0) + 1
+        return {
+            "data": {
+                "time_range": time_range,
+                "group_by": group_by,
+                "total_alerts": len(alerts),
+                "groups": groups,
+            }
+        }
+
+    async def analyze_alert_patterns(self, time_range: str, min_frequency: int) -> Dict[str, Any]:
+        """Analyze alert patterns — aggregated from Wazuh Indexer."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        start = self._time_range_to_start(time_range)
+        result = await self._indexer_client.get_alerts(limit=1000, timestamp_start=start)
+        alerts = result.get("data", {}).get("affected_items", [])
+        rule_counts: Dict[str, Dict[str, Any]] = {}
+        for alert in alerts:
+            rule = alert.get("rule", {})
+            rule_id = rule.get("id", "unknown")
+            if rule_id not in rule_counts:
+                rule_counts[rule_id] = {
+                    "count": 0,
+                    "description": rule.get("description", ""),
+                    "level": rule.get("level", 0),
+                }
+            rule_counts[rule_id]["count"] += 1
+        patterns = [{"rule_id": k, **v} for k, v in rule_counts.items() if v["count"] >= min_frequency]
+        patterns.sort(key=lambda x: x["count"], reverse=True)
+        return {
+            "data": {
+                "time_range": time_range,
+                "min_frequency": min_frequency,
+                "patterns": patterns,
+                "total_patterns": len(patterns),
+            }
+        }
+
+    async def search_security_events(self, query: str, time_range: str, limit: int) -> Dict[str, Any]:
+        """Search security events via the Wazuh Indexer with query filtering."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        start = self._time_range_to_start(time_range)
+        # Fetch a larger batch from the indexer, then filter by query
+        fetch_limit = min(limit * 5, 2000)
+        result = await self._indexer_client.get_alerts(limit=fetch_limit, timestamp_start=start)
+        if query:
+            alerts = result.get("data", {}).get("affected_items", [])
+            query_lower = query.lower()
+            filtered = [a for a in alerts if _dict_contains_text(a, query_lower)]
+            result["data"]["affected_items"] = filtered[:limit]
+            result["data"]["total_affected_items"] = len(filtered)
+        return result
+
+    async def get_running_agents(self) -> Dict[str, Any]:
+        """Get running agents."""
+        return await self._request("GET", "/agents", params={"status": "active"})
+
+    async def check_agent_health(self, agent_id: str) -> Dict[str, Any]:
+        """Check agent health by fetching agent info and extracting status."""
+        result = await self._request(
+            "GET",
+            "/agents",
+            params={
+                "agents_list": agent_id,
+                "select": "id,name,status,ip,os.name,os.version,version,lastKeepAlive,dateAdd,group,node_name",
+            },
+        )
+        agents = result.get("data", {}).get("affected_items", [])
+        if not agents:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent = agents[0]
+        status = agent.get("status", "unknown")
+        return {
+            "data": {
+                "agent_id": agent.get("id"),
+                "name": agent.get("name"),
+                "status": status,
+                "health": "healthy" if status == "active" else "unhealthy",
+                "ip": agent.get("ip"),
+                "os": agent.get("os", {}),
+                "version": agent.get("version"),
+                "last_keep_alive": agent.get("lastKeepAlive"),
+                "date_add": agent.get("dateAdd"),
+                "group": agent.get("group"),
+                "node_name": agent.get("node_name"),
+            }
+        }
+
+    async def get_agent_processes(self, agent_id: str, limit: int) -> Dict[str, Any]:
+        """Get agent processes."""
+        return await self._request("GET", f"/syscollector/{agent_id}/processes", params={"limit": limit})
+
+    async def get_agent_ports(self, agent_id: str, limit: int) -> Dict[str, Any]:
+        """Get agent ports."""
+        return await self._request("GET", f"/syscollector/{agent_id}/ports", params={"limit": limit})
+
+    async def get_agent_configuration(self, agent_id: str) -> Dict[str, Any]:
+        """Get agent configuration by fetching agent info and its group config."""
+        agent_result = await self._request(
+            "GET",
+            "/agents",
+            params={"agents_list": agent_id, "select": "id,name,group,configSum,mergedSum,status,version"},
+        )
+        agents = agent_result.get("data", {}).get("affected_items", [])
+        if not agents:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent = agents[0]
+        config_data: Dict[str, Any] = {"agent": agent, "group_configuration": []}
+        groups = agent.get("group", [])
+        if groups:
+            group_name = groups[0] if isinstance(groups, list) else groups
+            try:
+                group_config = await self._request("GET", f"/groups/{group_name}/configuration")
+                config_data["group_configuration"] = group_config.get("data", {}).get("affected_items", [])
+            except Exception:
+                config_data["group_configuration"] = []
+        return {"data": config_data}
+
+    async def get_critical_vulnerabilities(self, limit: int) -> Dict[str, Any]:
+        """
+        Get critical vulnerabilities from Wazuh Indexer (4.8.0+ required).
+
+        Args:
+            limit: Maximum number of results
+
+        Returns:
+            Critical vulnerability data from the indexer
+
+        Raises:
+            IndexerNotConfiguredError: If Wazuh Indexer is not configured
+        """
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+
+        return await self._indexer_client.get_critical_vulnerabilities(limit=limit)
+
+    async def get_vulnerability_summary(self, time_range: str) -> Dict[str, Any]:
+        """
+        Get vulnerability summary statistics from Wazuh Indexer (4.8.0+ required).
+
+        Args:
+            time_range: Time range for the summary (currently not used, returns all current vulnerabilities)
+
+        Returns:
+            Vulnerability summary with counts by severity
+
+        Raises:
+            IndexerNotConfiguredError: If Wazuh Indexer is not configured
+        """
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+
+        return await self._indexer_client.get_vulnerability_summary()
+
+    async def analyze_security_threat(self, indicator: str, indicator_type: str) -> Dict[str, Any]:
+        """Analyze security threat by searching alerts for the indicator."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        result = await self._indexer_client.get_alerts(limit=100)
+        alerts = result.get("data", {}).get("affected_items", [])
+        indicator_lower = indicator.lower()
+        matches = [a for a in alerts if _dict_contains_text(a, indicator_lower)]
+        return {
+            "data": {
+                "indicator": indicator,
+                "type": indicator_type,
+                "matching_alerts": len(matches),
+                "alerts": matches[:20],
+            }
+        }
+
+    async def check_ioc_reputation(self, indicator: str, indicator_type: str) -> Dict[str, Any]:
+        """Check IoC reputation by searching alert history."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        result = await self._indexer_client.get_alerts(limit=500)
+        alerts = result.get("data", {}).get("affected_items", [])
+        occurrences = 0
+        max_level = 0
+        indicator_lower = indicator.lower()
+        for alert in alerts:
+            if _dict_contains_text(alert, indicator_lower):
+                occurrences += 1
+                level = alert.get("rule", {}).get("level", 0)
+                if isinstance(level, int) and level > max_level:
+                    max_level = level
+        risk = "high" if max_level >= 10 else "medium" if max_level >= 5 else "low"
+        return {
+            "data": {
+                "indicator": indicator,
+                "type": indicator_type,
+                "occurrences": occurrences,
+                "max_alert_level": max_level,
+                "risk": risk,
+            }
+        }
+
+    async def perform_risk_assessment(self, agent_id: str = None) -> Dict[str, Any]:
+        """Perform risk assessment from real agent and vulnerability data."""
+        risk_factors: list = []
+        params: Dict[str, Any] = {"select": "id,name,status,os.name,version"}
+        if agent_id:
+            params["agents_list"] = agent_id
+        agents = await self._request("GET", "/agents", params=params)
+        items = agents.get("data", {}).get("affected_items", [])
+        disconnected = [a for a in items if a.get("status") != "active"]
+        if disconnected:
+            risk_factors.append({"factor": "disconnected_agents", "count": len(disconnected), "severity": "high"})
+        if self._indexer_client:
+            try:
+                vuln_summary = await self._indexer_client.get_vulnerability_summary()
+                critical = vuln_summary.get("data", {}).get("critical", 0)
+                if critical > 0:
+                    risk_factors.append(
+                        {"factor": "critical_vulnerabilities", "count": critical, "severity": "critical"}
+                    )
+            except Exception:
+                pass
+        if any(f["severity"] == "critical" for f in risk_factors):
+            risk_level = "critical"
+        elif any(f["severity"] == "high" for f in risk_factors):
+            risk_level = "high"
+        else:
+            risk_level = "medium"
+        return {
+            "data": {
+                "total_agents": len(items),
+                "risk_factors": risk_factors,
+                "risk_level": risk_level,
+            }
+        }
+
+    async def get_top_security_threats(self, limit: int, time_range: str) -> Dict[str, Any]:
+        """Get top threats by alert rule frequency from Indexer."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        start = self._time_range_to_start(time_range)
+        result = await self._indexer_client.get_alerts(limit=1000, timestamp_start=start)
+        alerts = result.get("data", {}).get("affected_items", [])
+        rule_counts: Dict[str, Dict[str, Any]] = {}
+        for alert in alerts:
+            rule = alert.get("rule", {})
+            rule_id = rule.get("id", "unknown")
+            if rule_id not in rule_counts:
+                rule_counts[rule_id] = {
+                    "rule_id": rule_id,
+                    "description": rule.get("description", ""),
+                    "level": rule.get("level", 0),
+                    "count": 0,
+                    "groups": rule.get("groups", []),
+                }
+            rule_counts[rule_id]["count"] += 1
+        threats = sorted(rule_counts.values(), key=lambda x: (-x.get("level", 0), -x["count"]))[:limit]
+        return {"data": {"time_range": time_range, "threats": threats, "total_unique_rules": len(rule_counts)}}
+
+    async def generate_security_report(self, report_type: str, include_recommendations: bool) -> Dict[str, Any]:
+        """Generate security report by aggregating data from multiple real endpoints."""
+        report: Dict[str, Any] = {
+            "report_type": report_type,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "sections": {},
+        }
+        try:
+            agents = await self._request("GET", "/agents", params={"limit": 500})
+            items = agents.get("data", {}).get("affected_items", [])
+            active = sum(1 for a in items if a.get("status") == "active")
+            report["sections"]["agents"] = {"total": len(items), "active": active, "disconnected": len(items) - active}
+        except Exception as e:
+            report["sections"]["agents"] = {"error": str(e)}
+        try:
+            info = await self._request("GET", "/")
+            report["sections"]["manager"] = info.get("data", {})
+        except Exception as e:
+            report["sections"]["manager"] = {"error": str(e)}
+        if self._indexer_client:
+            try:
+                vuln_summary = await self._indexer_client.get_vulnerability_summary()
+                report["sections"]["vulnerabilities"] = vuln_summary.get("data", {})
+            except Exception as e:
+                report["sections"]["vulnerabilities"] = {"error": str(e)}
+        return {"data": report}
+
+    async def run_compliance_check(self, framework: str, agent_id: str = None) -> Dict[str, Any]:
+        """Run compliance check using Wazuh SCA data."""
+        if agent_id:
+            try:
+                return await self._request("GET", f"/sca/{agent_id}")
+            except Exception as e:
+                raise ValueError(
+                    f"SCA data unavailable for agent {agent_id}: {e}. "
+                    "The /sca endpoint may not be supported on this agent or Wazuh version."
+                )
+        agents_result = await self._request(
+            "GET", "/agents", params={"status": "active", "limit": 10, "select": "id,name"}
+        )
+        agents = agents_result.get("data", {}).get("affected_items", [])
+        sca_results = []
+        for agent in agents[:5]:
+            aid = agent.get("id")
+            try:
+                sca = await self._request("GET", f"/sca/{aid}")
+                sca_results.append({"agent_id": aid, "agent_name": agent.get("name"), "sca": sca.get("data", {})})
+            except Exception:
+                sca_results.append({"agent_id": aid, "agent_name": agent.get("name"), "sca": {"error": "unavailable"}})
+        return {"data": {"framework": framework, "agents_checked": len(sca_results), "results": sca_results}}
+
+    async def get_wazuh_statistics(self) -> Dict[str, Any]:
+        """Get Wazuh statistics."""
+        return await self._request("GET", "/manager/stats")
+
+    async def get_weekly_stats(self) -> Dict[str, Any]:
+        """Get weekly statistics."""
+        return await self._request("GET", "/manager/stats/weekly")
+
+    async def get_cluster_health(self) -> Dict[str, Any]:
+        """Get cluster health."""
+        return await self._request("GET", "/cluster/healthcheck")
+
+    async def get_cluster_nodes(self) -> Dict[str, Any]:
+        """Get cluster nodes (cached for 2 minutes)."""
+        cache_key = "cluster_nodes"
+        return await self._get_cached(cache_key, "/cluster/nodes")
+
+    async def get_rules_summary(self) -> Dict[str, Any]:
+        """Get rules summary aggregated from /rules endpoint."""
+        cache_key = "rules_summary"
+        current_time = time.time()
+        if cache_key in self._cache:
+            cached_time, cached_data = self._cache[cache_key]
+            if current_time - cached_time < self._cache_ttl:
+                return cached_data
+
+        result = await self._request("GET", "/rules", params={"limit": 500})
+        rules = result.get("data", {}).get("affected_items", [])
+        level_counts: Dict[int, int] = {}
+        group_counts: Dict[str, int] = {}
+        for rule in rules:
+            level = int(rule.get("level", 0))
+            level_counts[level] = level_counts.get(level, 0) + 1
+            for group in rule.get("groups", []):
+                group_counts[group] = group_counts.get(group, 0) + 1
+
+        summary = {
+            "data": {
+                "total_rules": len(rules),
+                "by_level": dict(sorted(level_counts.items())),
+                "top_groups": dict(sorted(group_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
+            }
+        }
+        self._cache[cache_key] = (current_time, summary)
+        return summary
+
+    async def get_remoted_stats(self) -> Dict[str, Any]:
+        """Get remoted statistics."""
+        return await self._request("GET", "/manager/stats/remoted")
+
+    async def get_log_collector_stats(self) -> Dict[str, Any]:
+        """Get analysis daemon statistics."""
+        return await self._request("GET", "/manager/stats/analysisd")
+
+    async def search_manager_logs(self, query: str, limit: int) -> Dict[str, Any]:
+        """Search manager logs."""
+        params = {"q": query, "limit": limit}
+        return await self._request("GET", "/manager/logs", params=params)
+
+    async def get_manager_error_logs(self, limit: int) -> Dict[str, Any]:
+        """Get manager error logs."""
+        params = {"level": "error", "limit": limit}
+        return await self._request("GET", "/manager/logs", params=params)
+
+    async def validate_connection(self) -> Dict[str, Any]:
+        """Validate Wazuh connection."""
+        try:
+            result = await self._request("GET", "/")
+            return {"status": "connected", "details": result}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
+
+    # =========================================================================
+    # Active Response / Action Tools
+    # =========================================================================
+
+    @staticmethod
+    def _sanitize_ar_argument(value: str, param_name: str) -> str:
+        """Sanitize active response argument to prevent command injection.
+
+        Active response arguments are passed to shell commands on agents.
+        Only allow safe characters to prevent shell metacharacter injection.
+        """
+        import re
+
+        # Strip leading/trailing whitespace
+        value = value.strip()
+        if not value:
+            raise ValueError(f"{param_name} cannot be empty")
+        # Block shell metacharacters and control chars
+        if re.search(r'[;&|`$(){}\[\]<>!\\\'"\n\r\t]', value):
+            raise ValueError(f"{param_name} contains invalid characters")
+        # Audit fix M6: Block flag injection for standalone values
+        if not param_name.startswith("parameter:") and value.startswith("-"):
+            raise ValueError(f"{param_name} must not start with '-'")
+        return value
+
+    @staticmethod
+    def _validate_ip(ip_address: str, param_name: str = "ip_address") -> str:
+        """Validate IPv4 or IPv6 address format."""
+        import re
+        ip_address = ip_address.strip()
+        # IPv4
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip_address):
+            octets = ip_address.split('.')
+            if all(0 <= int(o) <= 255 for o in octets):
+                return ip_address
+        # IPv6 (simplified check)
+        if ':' in ip_address and re.match(r'^[0-9a-fA-F:]+$', ip_address):
+            return ip_address
+        raise ValueError(f"Invalid IP address format for {param_name}: {ip_address}")
+
+    async def block_ip(self, ip_address: str, duration: int = 0, agent_id: str = None) -> Dict[str, Any]:
+        """Block IP via firewall-drop active response."""
+        ip_address = self._validate_ip(ip_address)
+        ip_address = self._sanitize_ar_argument(ip_address, "ip_address")
+        arguments = [f"-srcip {ip_address}"]
+        if duration and duration > 0:
+            arguments.append(f"-timeout {int(duration)}")
+        data = {
+            "command": "!firewall-drop",
+            "agent_list": [agent_id] if agent_id else ["all"],
+            "arguments": arguments,
+            "alert": {"data": {"srcip": ip_address}},
+        }
+        return await self.execute_active_response(data)
+
+    async def isolate_host(self, agent_id: str) -> Dict[str, Any]:
+        """Isolate host from network via active response."""
+        if not agent_id:
+            raise ValueError("agent_id is required for host isolation")
+        data = {"command": "!host-isolation", "agent_list": [agent_id], "arguments": []}
+        return await self.execute_active_response(data)
+
+    async def kill_process(self, agent_id: str, process_id: int) -> Dict[str, Any]:
+        """Kill process on agent via active response."""
+        if not agent_id:
+            raise ValueError("agent_id is required for kill_process")
+        try:
+            pid = int(process_id)
+        except (ValueError, TypeError):
+            raise ValueError(f"process_id must be numeric, got: {process_id}")
+        data = {"command": "!kill-process", "agent_list": [agent_id], "arguments": [str(pid)]}
+        return await self.execute_active_response(data)
+
+    async def disable_user(self, agent_id: str, username: str) -> Dict[str, Any]:
+        """Disable user account on agent via active response."""
+        if not agent_id:
+            raise ValueError("agent_id is required for disable_user")
+        username = self._sanitize_ar_argument(username, "username")
+        data = {"command": "!disable-account", "agent_list": [agent_id], "arguments": [username]}
+        return await self.execute_active_response(data)
+
+    async def quarantine_file(self, agent_id: str, file_path: str) -> Dict[str, Any]:
+        """Quarantine file on agent via active response."""
+        if not agent_id:
+            raise ValueError("agent_id is required for quarantine_file")
+        file_path = self._sanitize_ar_argument(file_path, "file_path")
+        data = {"command": "!quarantine", "agent_list": [agent_id], "arguments": [file_path]}
+        return await self.execute_active_response(data)
+
+    # Known Wazuh active response commands (with ! prefix for stateful execution)
+    ALLOWED_AR_COMMANDS = frozenset([
+        "!firewall-drop", "!host-isolation", "!kill-process",
+        "!disable-account", "!enable-account", "!quarantine",
+        "!host-deny", "!restart-wazuh",
+    ])
+
+    async def run_active_response(self, agent_id: str, command: str, parameters: dict = None) -> Dict[str, Any]:
+        """Execute generic active response command."""
+        if command not in self.ALLOWED_AR_COMMANDS:
+            raise ValueError(
+                f"Unknown active response command: {command}. "
+                f"Allowed commands: {', '.join(sorted(self.ALLOWED_AR_COMMANDS))}"
+            )
+        args = []
+        if parameters:
+            args = [self._sanitize_ar_argument(f"{k}={v}", f"parameter:{k}") for k, v in parameters.items()]
+        data = {"command": command, "agent_list": [agent_id], "arguments": args}
+        return await self.execute_active_response(data)
+
+    async def firewall_drop(self, agent_id: str, src_ip: str, duration: int = 0) -> Dict[str, Any]:
+        """Add firewall drop rule via active response."""
+        src_ip = self._validate_ip(src_ip, "src_ip")
+        src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        arguments = [f"-srcip {src_ip}"]
+        if duration and duration > 0:
+            arguments.append(f"-timeout {int(duration)}")
+        data = {
+            "command": "!firewall-drop",
+            "agent_list": [agent_id],
+            "arguments": arguments,
+            "alert": {"data": {"srcip": src_ip}},
+        }
+        return await self.execute_active_response(data)
+
+    async def host_deny(self, agent_id: str, src_ip: str) -> Dict[str, Any]:
+        """Add hosts.deny entry via active response."""
+        src_ip = self._validate_ip(src_ip, "src_ip")
+        src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        data = {
+            "command": "!host-deny",
+            "agent_list": [agent_id],
+            "arguments": [f"-srcip {src_ip}"],
+            "alert": {"data": {"srcip": src_ip}},
+        }
+        return await self.execute_active_response(data)
+
+    async def restart_service(self, target: str) -> Dict[str, Any]:
+        """Restart Wazuh agent or manager."""
+        if target == "manager":
+            return await self._request("PUT", "/manager/restart")
+        return await self._request("PUT", f"/agents/{target}/restart")
+
+    # =========================================================================
+    # Verification Tools
+    # =========================================================================
+
+    async def check_blocked_ip(self, ip_address: str, agent_id: str = None) -> Dict[str, Any]:
+        """Check if IP is blocked by searching active response alerts."""
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError()
+        result = await self._indexer_client.get_alerts(limit=50)
+        alerts = result.get("data", {}).get("affected_items", [])
+        matches = [a for a in alerts if _dict_contains_text(a, ip_address) and _dict_contains_text(a, "firewall-drop")]
+        return {"data": {"ip_address": ip_address, "blocked": len(matches) > 0, "matching_alerts": len(matches)}}
+
+    async def check_agent_isolation(self, agent_id: str) -> Dict[str, Any]:
+        """Check agent isolation status by examining agent connectivity and alert history."""
+        result = await self._request("GET", "/agents", params={"agents_list": agent_id, "select": "id,name,status"})
+        agents = result.get("data", {}).get("affected_items", [])
+        if not agents:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent = agents[0]
+        status = agent.get("status")
+        # Check alert history for isolation commands if indexer is available
+        isolation_confirmed = False
+        if self._indexer_client and status == "disconnected":
+            try:
+                alerts = await self._indexer_client.get_alerts(limit=20)
+                items = alerts.get("data", {}).get("affected_items", [])
+                isolation_confirmed = any(
+                    _dict_contains_text(a, "host-isolation") and _dict_contains_text(a, agent_id) for a in items
+                )
+            except Exception:
+                pass
+        return {
+            "data": {
+                "agent_id": agent_id,
+                "status": status,
+                "possibly_isolated": status == "disconnected",
+                "isolation_confirmed": isolation_confirmed,
+                "name": agent.get("name"),
+                "note": "A disconnected agent may be isolated or simply offline. "
+                "Check isolation_confirmed for active response evidence.",
+            }
+        }
+
+    async def check_process(self, agent_id: str, process_id: int) -> Dict[str, Any]:
+        """Check if a process is still running on an agent."""
+        result = await self._request("GET", f"/syscollector/{agent_id}/processes", params={"limit": 500})
+        processes = result.get("data", {}).get("affected_items", [])
+        running = any(str(p.get("pid")) == str(process_id) for p in processes)
+        return {"data": {"agent_id": agent_id, "process_id": process_id, "running": running}}
+
+    async def check_user_status(self, agent_id: str, username: str) -> Dict[str, Any]:
+        """Check user account status by searching active response alerts and agent logs."""
+        # Search for disable-account active response alerts
+        disable_evidence = False
+        enable_evidence = False
+        if self._indexer_client:
+            try:
+                alerts = await self._indexer_client.get_alerts(limit=50)
+                items = alerts.get("data", {}).get("affected_items", [])
+                for alert in items:
+                    if _dict_contains_text(alert, username) and _dict_contains_text(alert, agent_id):
+                        if _dict_contains_text(alert, "disable-account"):
+                            disable_evidence = True
+                        if _dict_contains_text(alert, "enable-account"):
+                            enable_evidence = True
+            except Exception:
+                pass
+        # Most recent action takes precedence
+        likely_disabled = disable_evidence and not enable_evidence
+        return {
+            "data": {
+                "agent_id": agent_id,
+                "username": username,
+                "likely_disabled": likely_disabled,
+                "disable_action_found": disable_evidence,
+                "enable_action_found": enable_evidence,
+                "note": "Status based on active response alert history. " "Verify on the host for definitive status.",
+            }
+        }
+
+    async def check_file_quarantine(self, agent_id: str, file_path: str) -> Dict[str, Any]:
+        """Check if a file has been quarantined via FIM events."""
+        result = await self._request("GET", "/syscheck", params={"agents_list": agent_id, "q": f"file={file_path}"})
+        events = result.get("data", {}).get("affected_items", [])
+        quarantined = any(e.get("type") == "deleted" or "quarantine" in str(e) for e in events)
+        return {"data": {"agent_id": agent_id, "file_path": file_path, "quarantined": quarantined}}
+
+    # =========================================================================
+    # Rollback Tools
+    # =========================================================================
+
+    async def unisolate_host(self, agent_id: str) -> Dict[str, Any]:
+        """Remove host isolation via active response."""
+        data = {"command": "!host-isolation", "agent_list": [agent_id], "arguments": ["undo"]}
+        return await self.execute_active_response(data)
+
+    async def enable_user(self, agent_id: str, username: str) -> Dict[str, Any]:
+        """Re-enable user account via active response."""
+        username = self._sanitize_ar_argument(username, "username")
+        data = {"command": "!enable-account", "agent_list": [agent_id], "arguments": [username]}
+        return await self.execute_active_response(data)
+
+    async def restore_file(self, agent_id: str, file_path: str) -> Dict[str, Any]:
+        """Restore a quarantined file via active response."""
+        file_path = self._sanitize_ar_argument(file_path, "file_path")
+        data = {"command": "!quarantine", "agent_list": [agent_id], "arguments": ["restore", file_path]}
+        return await self.execute_active_response(data)
+
+    async def firewall_allow(self, agent_id: str, src_ip: str) -> Dict[str, Any]:
+        """Remove firewall drop rule via active response."""
+        src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        data = {
+            "command": "!firewall-drop",
+            "agent_list": [agent_id],
+            "arguments": [f"-srcip {src_ip}", "delete"],
+        }
+        return await self.execute_active_response(data)
+
+    async def host_allow(self, agent_id: str, src_ip: str) -> Dict[str, Any]:
+        """Remove hosts.deny entry via active response."""
+        src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        data = {
+            "command": "!host-deny",
+            "agent_list": [agent_id],
+            "arguments": [f"-srcip {src_ip}", "delete"],
+        }
+        return await self.execute_active_response(data)
+
+    async def close(self):
+        """Close the HTTP client and indexer client."""
+        if self.client:
+            await self.client.aclose()
+        if self._indexer_client:
+            await self._indexer_client.close()

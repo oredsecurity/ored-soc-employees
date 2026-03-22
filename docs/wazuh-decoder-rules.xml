@@ -1,0 +1,56 @@
+<!-- ORED SOC Audit Decoder -->
+<!-- Deploy to: /var/ossec/etc/decoders/ored_soc_decoder.xml -->
+<!-- Then restart Wazuh: systemctl restart wazuh-manager -->
+
+<decoder name="ored-soc">
+  <program_name>ored-soc</program_name>
+</decoder>
+
+<decoder name="ored-soc-fields">
+  <parent>ored-soc</parent>
+  <regex>tool=(\S+) action_class=(\S+) status=(\S+) decision=(\S+) payload=(.*)</regex>
+  <order>data.tool, data.action_class, data.status, data.decision, data.payload</order>
+</decoder>
+
+<!-- ORED SOC Audit Rules -->
+<!-- Deploy to: /var/ossec/etc/rules/ored_soc_rules.xml -->
+
+<group name="ored-soc,">
+
+  <rule id="100100" level="3">
+    <decoded_as>ored-soc</decoded_as>
+    <description>ORED SOC: Agent action (auto-allowed)</description>
+    <group>ored-soc,audit,</group>
+  </rule>
+
+  <rule id="100101" level="8">
+    <if_sid>100100</if_sid>
+    <field name="data.action_class">approval_required</field>
+    <field name="data.status">success</field>
+    <description>ORED SOC: Destructive action executed (approved)</description>
+    <group>ored-soc,audit,active-response,</group>
+  </rule>
+
+  <rule id="100102" level="6">
+    <if_sid>100100</if_sid>
+    <field name="data.action_class">approval_required</field>
+    <field name="data.status">denied</field>
+    <description>ORED SOC: Action denied by operator</description>
+    <group>ored-soc,audit,</group>
+  </rule>
+
+  <rule id="100103" level="12">
+    <if_sid>100100</if_sid>
+    <field name="data.action_class">forbidden</field>
+    <description>ORED SOC: Forbidden action attempted — possible policy violation</description>
+    <group>ored-soc,audit,policy-violation,</group>
+  </rule>
+
+  <rule id="100104" level="7">
+    <if_sid>100100</if_sid>
+    <field name="data.status">timeout</field>
+    <description>ORED SOC: Action approval timed out</description>
+    <group>ored-soc,audit,</group>
+  </rule>
+
+</group>

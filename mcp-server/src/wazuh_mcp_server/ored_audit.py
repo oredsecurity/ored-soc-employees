@@ -29,6 +29,28 @@ from starlette.responses import Response
 
 logger = logging.getLogger("ored.audit")
 
+# Lazy imports to avoid circular dependencies
+_approval_bot = None
+_wazuh_audit = None
+
+
+def _get_approval_bot():
+    """Lazy-load the Telegram approval bot."""
+    global _approval_bot
+    if _approval_bot is None:
+        from wazuh_mcp_server.ored_approval import approval_bot
+        _approval_bot = approval_bot
+    return _approval_bot
+
+
+def _get_wazuh_audit():
+    """Lazy-load the Wazuh audit sender."""
+    global _wazuh_audit
+    if _wazuh_audit is None:
+        from wazuh_mcp_server.ored_wazuh_audit import wazuh_audit
+        _wazuh_audit = wazuh_audit
+    return _wazuh_audit
+
 
 # ─────────────────────────────────────────────
 # Action Classification
@@ -310,6 +332,20 @@ class OREDAuditMiddleware(BaseHTTPMiddleware):
                 error_message=f"Tool '{tool_name}' is forbidden by ORED security policy",
             )
 
+            # Log to Wazuh audit trail
+            try:
+                await _get_wazuh_audit().send_audit_event(
+                    tool_name=tool_name,
+                    action_class=action_class.value,
+                    status="blocked",
+                    params=sanitize_params(tool_params),
+                    decision="blocked",
+                    session_id=session_id,
+                    error_message="Forbidden by ORED security policy",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send forbidden audit to Wazuh: {e}")
+
             from starlette.responses import JSONResponse
             return JSONResponse(
                 status_code=403,
@@ -324,6 +360,62 @@ class OREDAuditMiddleware(BaseHTTPMiddleware):
                 },
             )
 
+        # Handle approval-required actions
+        if action_class == ActionClass.APPROVAL_REQUIRED:
+            bot = _get_approval_bot()
+            approval = await bot.request_approval(
+                tool_name=tool_name,
+                params=sanitize_params(tool_params),
+                session_id=session_id,
+            )
+
+            if approval.decision != "approved":
+                # Denied, timed out, or errored — block the action
+                deny_reason = approval.denial_reason or approval.decision
+                audit_logger.log(
+                    tool_name=tool_name,
+                    params=tool_params,
+                    action_class=action_class,
+                    status=str(approval.decision),
+                    session_id=session_id,
+                    error_message=f"Action {approval.decision}: {deny_reason}",
+                )
+
+                # Log denial to Wazuh
+                try:
+                    await _get_wazuh_audit().send_audit_event(
+                        tool_name=tool_name,
+                        action_class=action_class.value,
+                        status=str(approval.decision),
+                        params=sanitize_params(tool_params),
+                        decision=str(approval.decision),
+                        decided_by=approval.decided_by,
+                        session_id=session_id,
+                        error_message=deny_reason,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send denial audit to Wazuh: {e}")
+
+                from starlette.responses import JSONResponse
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "jsonrpc": "2.0",
+                        "id": json.loads(body).get("id"),
+                        "error": {
+                            "code": -32600,
+                            "message": f"ORED SECURITY POLICY: Action '{tool_name}' was "
+                                       f"{approval.decision}. {deny_reason}",
+                        },
+                    },
+                )
+
+            # Approved — fall through to execution
+            logger.info(
+                f"Action '{tool_name}' APPROVED by {approval.decided_by} "
+                f"(request {approval.request_id})"
+            )
+
         # Execute the request and measure duration
         start_time = time.monotonic()
         try:
@@ -331,6 +423,10 @@ class OREDAuditMiddleware(BaseHTTPMiddleware):
             duration_ms = (time.monotonic() - start_time) * 1000
 
             status = "success" if response.status_code < 400 else "error"
+            decided_by = None
+            if action_class == ActionClass.APPROVAL_REQUIRED:
+                decided_by = approval.decided_by if 'approval' in dir() else None
+
             audit_logger.log(
                 tool_name=tool_name,
                 params=tool_params,
@@ -339,6 +435,22 @@ class OREDAuditMiddleware(BaseHTTPMiddleware):
                 session_id=session_id,
                 duration_ms=duration_ms,
             )
+
+            # Log to Wazuh audit trail
+            try:
+                await _get_wazuh_audit().send_audit_event(
+                    tool_name=tool_name,
+                    action_class=action_class.value,
+                    status=status,
+                    params=sanitize_params(tool_params),
+                    decision="approved" if action_class == ActionClass.APPROVAL_REQUIRED else "auto",
+                    decided_by=decided_by,
+                    duration_ms=duration_ms,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send audit to Wazuh: {e}")
+
             return response
 
         except Exception as e:
@@ -352,4 +464,19 @@ class OREDAuditMiddleware(BaseHTTPMiddleware):
                 duration_ms=duration_ms,
                 error_message=str(e),
             )
+
+            # Log error to Wazuh
+            try:
+                await _get_wazuh_audit().send_audit_event(
+                    tool_name=tool_name,
+                    action_class=action_class.value,
+                    status="error",
+                    params=sanitize_params(tool_params),
+                    duration_ms=duration_ms,
+                    session_id=session_id,
+                    error_message=str(e),
+                )
+            except Exception as ex:
+                logger.warning(f"Failed to send error audit to Wazuh: {ex}")
+
             raise

@@ -363,15 +363,28 @@ class OREDAuditMiddleware(BaseHTTPMiddleware):
         # Handle approval-required actions
         if action_class == ActionClass.APPROVAL_REQUIRED:
             bot = _get_approval_bot()
+
+            # Extract alert context from tool params if available
+            from wazuh_mcp_server.ored_approval import AlertContext
+            alert_ctx = AlertContext(
+                alert_id=str(tool_params.get("alert_id", tool_params.get("id", "N/A"))),
+                rule_name=str(tool_params.get("rule_name", tool_params.get("rule", "N/A"))),
+                severity=str(tool_params.get("severity", tool_params.get("level", "Medium"))),
+                asset=str(tool_params.get("agent_id", tool_params.get("ip", tool_params.get("hostname", "N/A")))),
+                reason=str(tool_params.get("reason", "Action requested by FORGE agent.")),
+            )
+
             approval = await bot.request_approval(
                 tool_name=tool_name,
                 params=sanitize_params(tool_params),
+                alert_context=alert_ctx,
                 session_id=session_id,
             )
 
-            if approval.decision != "approved":
-                # Denied, timed out, or errored — block the action
-                deny_reason = approval.denial_reason or approval.decision
+            # Fail closed: anything other than explicit APPROVED = abort
+            from wazuh_mcp_server.ored_approval import ApprovalDecision
+            if approval.decision != ApprovalDecision.APPROVED:
+                deny_reason = approval.denial_reason or str(approval.decision)
                 audit_logger.log(
                     tool_name=tool_name,
                     params=tool_params,

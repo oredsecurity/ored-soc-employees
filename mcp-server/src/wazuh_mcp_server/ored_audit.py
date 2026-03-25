@@ -8,7 +8,7 @@ Provides:
 - FastAPI middleware for intercepting all MCP tool calls
 
 Part of the ORED AI SOC Employees platform.
-https://github.com/oredsecurity/hermes-soc-employees
+https://github.com/oredsecurity/ored-soc-employees
 
 Copyright (c) 2026 ORED Labs. MIT License.
 """

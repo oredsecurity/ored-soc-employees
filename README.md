@@ -18,8 +18,8 @@ A production-ready stack that turns your Wazuh SIEM into an autonomous security 
 ## Quick Start
 
 ```bash
-git clone https://github.com/oredsecurity/hermes-soc-employees.git
-cd hermes-soc-employees
+git clone https://github.com/oredsecurity/ored-soc-employees.git
+cd ored-soc-employees
 ./install.sh
 ```
 

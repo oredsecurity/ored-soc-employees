@@ -5,8 +5,8 @@ set -euo pipefail
 # ORED AI SOC Employees — Quick Install
 # ═══════════════════════════════════════════════
 # Usage:
-#   git clone https://github.com/oredsecurity/hermes-soc-employees.git
-#   cd hermes-soc-employees
+#   git clone https://github.com/oredsecurity/ored-soc-employees.git
+#   cd ored-soc-employees
 #   ./install.sh
 
 BOLD="\033[1m"

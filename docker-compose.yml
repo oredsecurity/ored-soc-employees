@@ -39,6 +39,11 @@ services:
       - AUTH_MODE=${MCP_AUTH_MODE:-none}
       - AUTH_SECRET_KEY=${MCP_AUTH_SECRET:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Alert polling
+      - ORED_POLL_ENABLED=${ORED_POLL_ENABLED:-true}
+      - ORED_POLL_INTERVAL=${ORED_POLL_INTERVAL:-60}
+      - ORED_POLL_MIN_LEVEL=${ORED_POLL_MIN_LEVEL:-5}
+      - ORED_POLL_BATCH_SIZE=${ORED_POLL_BATCH_SIZE:-100}
       # Wazuh Indexer (optional, for vuln tools on Wazuh 4.8+)
       - WAZUH_INDEXER_HOST=${WAZUH_INDEXER_HOST:-}
       - WAZUH_INDEXER_PORT=${WAZUH_INDEXER_PORT:-9200}

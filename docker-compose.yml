@@ -3,15 +3,18 @@ version: "3.8"
 # ORED AI SOC Employees — Docker Compose Stack
 # https://github.com/oredsecurity/ored-soc-employees
 #
+# Two deployment modes:
+#
+#   Mode 1 — Full stack (MCP server + Hermes agent):
+#     docker compose up -d
+#
+#   Mode 2 — MCP server only (Hermes installed natively on host):
+#     docker compose up -d wazuh-mcp-server
+#
 # Prerequisites:
 #   - A running Wazuh instance (manager + API accessible)
 #   - Docker & Docker Compose installed
 #   - .env file configured (copy from .env.example)
-#
-# Usage:
-#   cp .env.example .env
-#   # Edit .env with your Wazuh credentials and API keys
-#   docker compose up -d
 
 services:
   # ─────────────────────────────────────────────
@@ -67,6 +70,9 @@ services:
   # Hermes Agent (the SOC employee brain)
   # Connects to MCP server, processes alerts,
   # requests approvals, takes action
+  #
+  # Omit this service when Hermes is installed
+  # natively: docker compose up -d wazuh-mcp-server
   # ─────────────────────────────────────────────
   hermes-agent:
     build:
@@ -74,13 +80,16 @@ services:
       dockerfile: Dockerfile
     container_name: ored-hermes-agent
     restart: unless-stopped
+    profiles:
+      - full
     depends_on:
       wazuh-mcp-server:
         condition: service_healthy
     environment:
-      # LLM backend
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      # LLM backend (any OpenAI-compatible provider)
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-}
       # Telegram approval interface
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}

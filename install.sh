@@ -7,17 +7,49 @@ set -euo pipefail
 # Usage:
 #   git clone https://github.com/oredsecurity/ored-soc-employees.git
 #   cd ored-soc-employees
-#   ./install.sh
+#
+#   ./install.sh              # Full stack: MCP server + Hermes agent
+#   ./install.sh --mcp-only   # MCP server only (Hermes installed natively)
 
 BOLD="\033[1m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
 info()  { echo -e "${GREEN}[INFO]${RESET} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 error() { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
+
+# ── Parse flags ─────────────────────────────
+MCP_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --mcp-only) MCP_ONLY=true ;;
+        -h|--help)
+            echo "Usage: ./install.sh [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --mcp-only   Run MCP server only (for hosts with Hermes installed natively)"
+            echo "  -h, --help   Show this help"
+            echo ""
+            echo "Modes:"
+            echo "  Full stack:  ./install.sh            Runs wazuh-mcp-server + hermes-agent"
+            echo "  MCP only:    ./install.sh --mcp-only  Runs wazuh-mcp-server only"
+            exit 0
+            ;;
+        *) error "Unknown option: $arg (use --help for usage)" ;;
+    esac
+done
+
+if [ "$MCP_ONLY" = true ]; then
+    MODE_LABEL="MCP Server Only"
+    MODE_DESC="Hermes agent will NOT be started (assumes native install on host)"
+else
+    MODE_LABEL="Full Stack"
+    MODE_DESC="MCP server + Hermes agent containers"
+fi
 
 echo -e "${BOLD}"
 echo "╔══════════════════════════════════════════╗"
@@ -25,6 +57,9 @@ echo "║   ORED AI SOC Employees — Installer     ║"
 echo "║   Autonomous Security Operations        ║"
 echo "╚══════════════════════════════════════════╝"
 echo -e "${RESET}"
+echo -e "  Mode: ${CYAN}${MODE_LABEL}${RESET}"
+echo -e "  ${MODE_DESC}"
+echo ""
 
 # ── Pre-flight checks ────────────────────────
 info "Running pre-flight checks..."
@@ -39,14 +74,15 @@ info "Docker version: ${DOCKER_VERSION}"
 if [ ! -f .env ]; then
     info "Creating .env from template..."
     cp .env.example .env
-    warn ".env created — you MUST edit it with your Wazuh credentials and API keys."
-    warn "  Open .env in your editor and fill in the REQUIRED fields."
+    warn ".env created. You MUST edit it with your credentials before continuing."
     echo ""
     warn "Required:"
     warn "  WAZUH_HOST     — Your Wazuh manager URL"
     warn "  WAZUH_USER     — Wazuh API username"
     warn "  WAZUH_PASS     — Wazuh API password"
-    warn "  ANTHROPIC_API_KEY — Your Anthropic API key"
+    if [ "$MCP_ONLY" = false ]; then
+        warn "  LLM_API_KEY    — API key for your LLM provider"
+    fi
     echo ""
     read -p "Press Enter after editing .env, or Ctrl+C to abort... "
 else
@@ -60,17 +96,28 @@ source .env 2>/dev/null || true
 [ -z "${WAZUH_USER:-}" ] && error "WAZUH_USER is not set in .env"
 [ -z "${WAZUH_PASS:-}" ] && error "WAZUH_PASS is not set in .env"
 [ "${WAZUH_PASS:-}" = "CHANGE_ME" ] && error "WAZUH_PASS is still set to CHANGE_ME — update it in .env"
-[ -z "${ANTHROPIC_API_KEY:-}" ] && error "ANTHROPIC_API_KEY is not set in .env"
-[ "${ANTHROPIC_API_KEY:-}" = "sk-ant-CHANGE_ME" ] && error "ANTHROPIC_API_KEY is still the placeholder — update it in .env"
+
+if [ "$MCP_ONLY" = false ]; then
+    [ -z "${LLM_API_KEY:-}" ] && error "LLM_API_KEY is not set in .env (required for full-stack mode)"
+    [ "${LLM_API_KEY:-}" = "***" ] && error "LLM_API_KEY is still the placeholder — update it in .env"
+fi
 
 info "Environment validated."
 
 # ── Build & Launch ───────────────────────────
-info "Building containers..."
-docker compose build
+if [ "$MCP_ONLY" = true ]; then
+    info "Building MCP server container..."
+    docker compose build wazuh-mcp-server
 
-info "Starting services..."
-docker compose up -d
+    info "Starting MCP server..."
+    docker compose up -d wazuh-mcp-server
+else
+    info "Building containers..."
+    docker compose --profile full build
+
+    info "Starting services..."
+    docker compose --profile full up -d
+fi
 
 echo ""
 info "Waiting for MCP server health check..."
@@ -86,7 +133,11 @@ fi
 
 echo ""
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
-echo -e "${BOLD}${GREEN}  ORED AI SOC Employee is running!${RESET}"
+if [ "$MCP_ONLY" = true ]; then
+    echo -e "${BOLD}${GREEN}  ORED MCP Server is running!${RESET}"
+else
+    echo -e "${BOLD}${GREEN}  ORED AI SOC Employee is running!${RESET}"
+fi
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
 echo ""
 echo "  MCP Server:  http://localhost:${MCP_PORT:-3000}"
@@ -95,7 +146,16 @@ echo "  Logs:        docker compose logs -f"
 echo ""
 echo "  Useful commands:"
 echo "    docker compose logs -f wazuh-mcp-server  # MCP server logs"
-echo "    docker compose logs -f hermes-agent       # Agent logs"
+if [ "$MCP_ONLY" = false ]; then
+    echo "    docker compose logs -f hermes-agent       # Agent logs"
+fi
 echo "    docker compose restart                    # Restart all"
 echo "    docker compose down                       # Stop all"
 echo ""
+if [ "$MCP_ONLY" = true ]; then
+    echo "  To connect your native Hermes instance:"
+    echo "    Add to ~/.hermes/config.yaml under mcp_servers:"
+    echo "      wazuh:"
+    echo "        url: http://localhost:${MCP_PORT:-3000}/mcp"
+    echo ""
+fi

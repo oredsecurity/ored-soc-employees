@@ -166,22 +166,36 @@ https://download.docker.com/linux/${OS_ID} $(. /etc/os-release && echo "$VERSION
     if [ "$(id -u)" -ne 0 ]; then
         if ! groups | grep -q docker; then
             $SUDO usermod -aG docker "$USER"
-            warn "Added $USER to docker group. You may need to log out and back in."
+            info "Added $USER to docker group."
         fi
     fi
 
     info "Docker installed successfully."
 }
 
+# ── Docker command wrapper ────────────────────
+# After installing Docker + adding user to docker group, the current
+# shell doesn't have the new group yet. Use sudo as fallback when
+# the socket isn't accessible.
+docker_cmd() {
+    if docker "$@" 2>/dev/null; then
+        return 0
+    elif [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        sudo docker "$@"
+    else
+        docker "$@"
+    fi
+}
+
 # ── Install missing compose/buildx plugins ────
 install_docker_plugins() {
     local MISSING_PLUGINS=()
 
-    if ! docker compose version >/dev/null 2>&1; then
+    if ! docker_cmd compose version >/dev/null 2>&1; then
         MISSING_PLUGINS+=("compose")
     fi
 
-    if ! docker buildx version >/dev/null 2>&1; then
+    if ! docker_cmd buildx version >/dev/null 2>&1; then
         MISSING_PLUGINS+=("buildx")
     fi
 
@@ -220,20 +234,29 @@ install_docker_plugins() {
                 local CLI_PLUGINS_DIR="/usr/local/lib/docker/cli-plugins"
                 $SUDO mkdir -p "$CLI_PLUGINS_DIR"
 
+                # Helper: fetch latest GitHub release tag without triggering
+                # broken-pipe errors under set -o pipefail.
+                # curl | grep | head causes curl to get SIGPIPE when head exits.
+                # Instead, capture full output first, then parse.
+                get_latest_tag() {
+                    local api_response
+                    api_response=$(curl -fsSL "$1" 2>/dev/null) || true
+                    echo "$api_response" | grep '"tag_name"' | head -1 | cut -d'"' -f4
+                }
+
                 for plugin in "${MISSING_PLUGINS[@]}"; do
                     if [ "$plugin" = "compose" ] && ! docker compose version >/dev/null 2>&1; then
                         info "Downloading docker-compose plugin..."
                         local COMPOSE_VERSION
-                        COMPOSE_VERSION=$(curl -fsSL "https://api.github.com/repos/docker/compose/releases/latest" \
-                            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+                        COMPOSE_VERSION=$(get_latest_tag "https://api.github.com/repos/docker/compose/releases/latest")
                         if [ -z "$COMPOSE_VERSION" ]; then
                             COMPOSE_VERSION="v2.36.1"
                             warn "Could not detect latest compose version, using ${COMPOSE_VERSION}"
                         fi
-                        local COMPOSE_ARCH="$ARCH"
-                        # compose uses x86_64/aarch64 in download URLs
-                        curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
-                            -o "${CLI_PLUGINS_DIR}/docker-compose"
+                        # compose release URLs use x86_64/aarch64
+                        curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${ARCH}" \
+                            -o /tmp/docker-compose
+                        $SUDO mv /tmp/docker-compose "${CLI_PLUGINS_DIR}/docker-compose"
                         $SUDO chmod +x "${CLI_PLUGINS_DIR}/docker-compose"
                         info "docker-compose plugin ${COMPOSE_VERSION} installed."
                     fi
@@ -241,8 +264,7 @@ install_docker_plugins() {
                     if [ "$plugin" = "buildx" ] && ! docker buildx version >/dev/null 2>&1; then
                         info "Downloading docker-buildx plugin..."
                         local BUILDX_VERSION
-                        BUILDX_VERSION=$(curl -fsSL "https://api.github.com/repos/docker/buildx/releases/latest" \
-                            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+                        BUILDX_VERSION=$(get_latest_tag "https://api.github.com/repos/docker/buildx/releases/latest")
                         if [ -z "$BUILDX_VERSION" ]; then
                             BUILDX_VERSION="v0.24.0"
                             warn "Could not detect latest buildx version, using ${BUILDX_VERSION}"
@@ -253,7 +275,8 @@ install_docker_plugins() {
                             aarch64) BUILDX_ARCH="arm64" ;;
                         esac
                         curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${BUILDX_ARCH}" \
-                            -o "${CLI_PLUGINS_DIR}/docker-buildx"
+                            -o /tmp/docker-buildx
+                        $SUDO mv /tmp/docker-buildx "${CLI_PLUGINS_DIR}/docker-buildx"
                         $SUDO chmod +x "${CLI_PLUGINS_DIR}/docker-buildx"
                         info "docker-buildx plugin ${BUILDX_VERSION} installed."
                     fi
@@ -274,10 +297,10 @@ install_docker_plugins() {
 
     # Verify
     for plugin in "${MISSING_PLUGINS[@]}"; do
-        if [ "$plugin" = "compose" ] && ! docker compose version >/dev/null 2>&1; then
+        if [ "$plugin" = "compose" ] && ! docker_cmd compose version >/dev/null 2>&1; then
             error "docker-compose-plugin installation failed. Install manually."
         fi
-        if [ "$plugin" = "buildx" ] && ! docker buildx version >/dev/null 2>&1; then
+        if [ "$plugin" = "buildx" ] && ! docker_cmd buildx version >/dev/null 2>&1; then
             error "docker-buildx-plugin installation failed. Install manually."
         fi
     done
@@ -346,18 +369,28 @@ install_docker_plugins
 # Step 3: Enable linger so containers survive SSH disconnect
 enable_linger
 
-# Step 4: Detect compose command (plugin should be installed by now, standalone as fallback)
-if docker compose version >/dev/null 2>&1; then
-    DC="docker compose"
+# Step 4: Determine if sudo is needed for docker commands
+# (user may have been added to docker group but current shell doesn't have it yet)
+DOCKER="docker"
+if ! docker version >/dev/null 2>&1; then
+    if [ "$(id -u)" -ne 0 ] && sudo docker version >/dev/null 2>&1; then
+        DOCKER="sudo docker"
+        info "Using sudo for docker (group membership will apply on next login)."
+    fi
+fi
+
+# Step 5: Detect compose command (plugin should be installed by now, standalone as fallback)
+if $DOCKER compose version >/dev/null 2>&1; then
+    DC="$DOCKER compose"
 elif command -v docker-compose >/dev/null 2>&1; then
     DC="docker-compose"
 else
     error "Docker Compose is not available. This should not happen after plugin install."
 fi
 
-DOCKER_VERSION=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
+DOCKER_VERSION=$($DOCKER version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
 DC_VERSION=$($DC version --short 2>/dev/null || $DC version 2>/dev/null | head -1 || echo "unknown")
-BUILDX_VERSION=$(docker buildx version 2>/dev/null | head -1 || echo "unknown")
+BUILDX_VERSION=$($DOCKER buildx version 2>/dev/null | head -1 || echo "unknown")
 info "Docker version: ${DOCKER_VERSION}"
 info "Compose: ${DC} (${DC_VERSION})"
 info "Buildx: ${BUILDX_VERSION}"

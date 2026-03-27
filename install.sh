@@ -10,6 +10,21 @@ set -euo pipefail
 #
 #   ./install.sh              # Full stack: MCP server + Hermes agent
 #   ./install.sh --mcp-only   # MCP server only (Hermes installed natively)
+#
+# Supported distros:
+#   - Amazon Linux 2023 (dnf)
+#   - Ubuntu 20.04 / 22.04 / 24.04 (apt)
+#   - Debian 11 / 12 (apt)
+#   - Any distro with Docker CE + compose plugin already installed
+#
+# What this script does:
+#   1. Detects OS and package manager (dnf/yum vs apt)
+#   2. Checks for Docker Engine; installs it if missing
+#   3. Checks for docker-compose-plugin and docker-buildx-plugin;
+#      installs them if missing (Amazon Linux ships Docker CE without these)
+#   4. Detects compose command: "docker compose" (plugin) or "docker-compose" (standalone)
+#   5. Validates .env configuration
+#   6. Builds and launches the stack
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -61,24 +76,236 @@ echo -e "  Mode: ${CYAN}${MODE_LABEL}${RESET}"
 echo -e "  ${MODE_DESC}"
 echo ""
 
+# ── OS Detection ──────────────────────────────
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_ID="${ID:-unknown}"
+        OS_VERSION="${VERSION_ID:-unknown}"
+        OS_NAME="${PRETTY_NAME:-unknown}"
+    else
+        OS_ID="unknown"
+        OS_VERSION="unknown"
+        OS_NAME="unknown"
+    fi
+
+    # Determine package manager
+    if command -v dnf >/dev/null 2>&1; then
+        PKG_MGR="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MGR="yum"
+    elif command -v apt-get >/dev/null 2>&1; then
+        PKG_MGR="apt"
+    else
+        PKG_MGR="unknown"
+    fi
+
+    info "OS: ${OS_NAME} (${OS_ID} ${OS_VERSION})"
+    info "Package manager: ${PKG_MGR}"
+}
+
+# ── Ensure root/sudo ─────────────────────────
+need_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then
+        SUDO=""
+    elif command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        error "This script needs root privileges to install packages. Run as root or install sudo."
+    fi
+}
+
+# ── Install Docker Engine if missing ──────────
+install_docker() {
+    info "Docker not found. Installing Docker Engine..."
+    need_sudo
+
+    case "$PKG_MGR" in
+        dnf|yum)
+            # Amazon Linux 2023 / RHEL / Fedora
+            $SUDO $PKG_MGR install -y docker
+            $SUDO systemctl enable --now docker
+            ;;
+        apt)
+            # Ubuntu / Debian: install from Docker's official repo
+            $SUDO apt-get update -y
+            $SUDO apt-get install -y ca-certificates curl gnupg
+
+            # Add Docker GPG key
+            $SUDO install -m 0755 -d /etc/apt/keyrings
+            if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+                curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" \
+                    | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+            fi
+
+            # Add Docker repo
+            if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/${OS_ID} $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+                    | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
+            fi
+
+            $SUDO apt-get update -y
+            $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
+            ;;
+        *)
+            error "Unsupported package manager: ${PKG_MGR}. Install Docker manually: https://docs.docker.com/get-docker/"
+            ;;
+    esac
+
+    # Add current user to docker group (non-root)
+    if [ "$(id -u)" -ne 0 ]; then
+        if ! groups | grep -q docker; then
+            $SUDO usermod -aG docker "$USER"
+            warn "Added $USER to docker group. You may need to log out and back in."
+        fi
+    fi
+
+    info "Docker installed successfully."
+}
+
+# ── Install missing compose/buildx plugins ────
+install_docker_plugins() {
+    local MISSING_PLUGINS=()
+
+    if ! docker compose version >/dev/null 2>&1; then
+        MISSING_PLUGINS+=("compose")
+    fi
+
+    if ! docker buildx version >/dev/null 2>&1; then
+        MISSING_PLUGINS+=("buildx")
+    fi
+
+    if [ ${#MISSING_PLUGINS[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    info "Missing Docker plugins: ${MISSING_PLUGINS[*]}. Installing..."
+    need_sudo
+
+    case "$PKG_MGR" in
+        dnf|yum)
+            # Amazon Linux 2023: Docker CE from amazon repo lacks compose/buildx.
+            # Install plugins from Docker's official repo or direct download.
+
+            # Try package install first (works if Docker official repo is configured)
+            local PKG_INSTALL_OK=true
+            for plugin in "${MISSING_PLUGINS[@]}"; do
+                if ! $SUDO $PKG_MGR install -y "docker-${plugin}-plugin" 2>/dev/null; then
+                    PKG_INSTALL_OK=false
+                    break
+                fi
+            done
+
+            # Fallback: direct binary install from GitHub releases
+            if [ "$PKG_INSTALL_OK" = false ]; then
+                warn "Package install failed, downloading plugins directly..."
+                local ARCH
+                ARCH=$(uname -m)
+                case "$ARCH" in
+                    x86_64)  ARCH="x86_64" ;;
+                    aarch64) ARCH="aarch64" ;;
+                    *) error "Unsupported architecture: ${ARCH}" ;;
+                esac
+
+                local CLI_PLUGINS_DIR="/usr/local/lib/docker/cli-plugins"
+                $SUDO mkdir -p "$CLI_PLUGINS_DIR"
+
+                for plugin in "${MISSING_PLUGINS[@]}"; do
+                    if [ "$plugin" = "compose" ] && ! docker compose version >/dev/null 2>&1; then
+                        info "Downloading docker-compose plugin..."
+                        local COMPOSE_VERSION
+                        COMPOSE_VERSION=$(curl -fsSL "https://api.github.com/repos/docker/compose/releases/latest" \
+                            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+                        if [ -z "$COMPOSE_VERSION" ]; then
+                            COMPOSE_VERSION="v2.36.1"
+                            warn "Could not detect latest compose version, using ${COMPOSE_VERSION}"
+                        fi
+                        local COMPOSE_ARCH="$ARCH"
+                        # compose uses x86_64/aarch64 in download URLs
+                        curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
+                            -o "${CLI_PLUGINS_DIR}/docker-compose"
+                        $SUDO chmod +x "${CLI_PLUGINS_DIR}/docker-compose"
+                        info "docker-compose plugin ${COMPOSE_VERSION} installed."
+                    fi
+
+                    if [ "$plugin" = "buildx" ] && ! docker buildx version >/dev/null 2>&1; then
+                        info "Downloading docker-buildx plugin..."
+                        local BUILDX_VERSION
+                        BUILDX_VERSION=$(curl -fsSL "https://api.github.com/repos/docker/buildx/releases/latest" \
+                            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+                        if [ -z "$BUILDX_VERSION" ]; then
+                            BUILDX_VERSION="v0.24.0"
+                            warn "Could not detect latest buildx version, using ${BUILDX_VERSION}"
+                        fi
+                        local BUILDX_ARCH
+                        case "$ARCH" in
+                            x86_64)  BUILDX_ARCH="amd64" ;;
+                            aarch64) BUILDX_ARCH="arm64" ;;
+                        esac
+                        curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${BUILDX_ARCH}" \
+                            -o "${CLI_PLUGINS_DIR}/docker-buildx"
+                        $SUDO chmod +x "${CLI_PLUGINS_DIR}/docker-buildx"
+                        info "docker-buildx plugin ${BUILDX_VERSION} installed."
+                    fi
+                done
+            fi
+            ;;
+        apt)
+            # Ubuntu / Debian: install from Docker's official repo
+            $SUDO apt-get update -y
+            for plugin in "${MISSING_PLUGINS[@]}"; do
+                $SUDO apt-get install -y "docker-${plugin}-plugin"
+            done
+            ;;
+        *)
+            error "Cannot auto-install Docker plugins on ${PKG_MGR}. Install docker-compose-plugin and docker-buildx-plugin manually."
+            ;;
+    esac
+
+    # Verify
+    for plugin in "${MISSING_PLUGINS[@]}"; do
+        if [ "$plugin" = "compose" ] && ! docker compose version >/dev/null 2>&1; then
+            error "docker-compose-plugin installation failed. Install manually."
+        fi
+        if [ "$plugin" = "buildx" ] && ! docker buildx version >/dev/null 2>&1; then
+            error "docker-buildx-plugin installation failed. Install manually."
+        fi
+    done
+
+    info "Docker plugins installed successfully."
+}
+
 # ── Pre-flight checks ────────────────────────
 info "Running pre-flight checks..."
+detect_os
 
-command -v docker >/dev/null 2>&1 || error "Docker is not installed. Install it first: https://docs.docker.com/get-docker/"
+# Step 1: Ensure Docker Engine is present
+if ! command -v docker >/dev/null 2>&1; then
+    install_docker
+fi
 
-# Detect docker compose: plugin syntax first, standalone fallback
+# Step 2: Ensure compose and buildx plugins are present
+install_docker_plugins
+
+# Step 3: Detect compose command (plugin should be installed by now, standalone as fallback)
 if docker compose version >/dev/null 2>&1; then
     DC="docker compose"
 elif command -v docker-compose >/dev/null 2>&1; then
     DC="docker-compose"
 else
-    error "Docker Compose is not installed. Install the docker-compose-plugin or standalone docker-compose."
+    error "Docker Compose is not available. This should not happen after plugin install."
 fi
 
 DOCKER_VERSION=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
 DC_VERSION=$($DC version --short 2>/dev/null || $DC version 2>/dev/null | head -1 || echo "unknown")
+BUILDX_VERSION=$(docker buildx version 2>/dev/null | head -1 || echo "unknown")
 info "Docker version: ${DOCKER_VERSION}"
-info "Compose command: ${DC} (${DC_VERSION})"
+info "Compose: ${DC} (${DC_VERSION})"
+info "Buildx: ${BUILDX_VERSION}"
 
 # ── Environment setup ────────────────────────
 if [ ! -f .env ]; then
@@ -94,7 +321,7 @@ if [ ! -f .env ]; then
         warn "  LLM_API_KEY    — API key for your LLM provider"
     fi
     echo ""
-    read -p "Press Enter after editing .env, or Ctrl+C to abort... "
+    read -rp "Press Enter after editing .env, or Ctrl+C to abort... "
 else
     info ".env already exists, using existing configuration."
 fi

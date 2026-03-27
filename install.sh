@@ -17,14 +17,20 @@ set -euo pipefail
 #   - Debian 11 / 12 (apt)
 #   - Any distro with Docker CE + compose plugin already installed
 #
-# What this script does:
+# Prerequisites (install before running this script):
+#   - git and curl: sudo dnf install -y git curl   (Amazon Linux)
+#                   sudo apt install -y git curl    (Ubuntu/Debian)
+#
+# What this script handles automatically:
 #   1. Detects OS and package manager (dnf/yum vs apt)
-#   2. Checks for Docker Engine; installs it if missing
-#   3. Checks for docker-compose-plugin and docker-buildx-plugin;
-#      installs them if missing (Amazon Linux ships Docker CE without these)
-#   4. Detects compose command: "docker compose" (plugin) or "docker-compose" (standalone)
-#   5. Validates .env configuration
-#   6. Builds and launches the stack
+#   2. Installs curl if missing
+#   3. Installs Docker Engine if missing
+#   4. Installs docker-compose-plugin and docker-buildx-plugin if missing
+#      (Amazon Linux ships Docker CE without these)
+#   5. Enables loginctl linger so containers survive SSH disconnect
+#   6. Detects compose command: "docker compose" (plugin) or "docker-compose" (standalone)
+#   7. Validates .env configuration
+#   8. Builds and launches the stack
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -279,9 +285,55 @@ install_docker_plugins() {
     info "Docker plugins installed successfully."
 }
 
+# ── Install base prerequisites (curl) ─────────
+install_prereqs() {
+    local NEED_INSTALL=false
+
+    if ! command -v curl >/dev/null 2>&1; then
+        NEED_INSTALL=true
+    fi
+
+    if [ "$NEED_INSTALL" = true ]; then
+        info "Installing prerequisites (curl)..."
+        need_sudo
+        case "$PKG_MGR" in
+            dnf|yum) $SUDO $PKG_MGR install -y curl ;;
+            apt)     $SUDO apt-get update -y && $SUDO apt-get install -y curl ;;
+            *)       error "Cannot install curl automatically. Install it manually and re-run." ;;
+        esac
+    fi
+}
+
+# ── Enable linger for current user ────────────
+# Without linger, systemd kills user processes (including containers)
+# when the SSH session disconnects. This makes containers persistent.
+enable_linger() {
+    # Only relevant for non-root users with systemd
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
+    fi
+
+    if ! command -v loginctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Check if linger is already enabled
+    if loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q "Linger=yes"; then
+        return 0
+    fi
+
+    info "Enabling loginctl linger for ${USER} (keeps containers running after SSH disconnect)..."
+    need_sudo
+    $SUDO loginctl enable-linger "$USER"
+    info "Linger enabled."
+}
+
 # ── Pre-flight checks ────────────────────────
 info "Running pre-flight checks..."
 detect_os
+
+# Step 0: Base prerequisites
+install_prereqs
 
 # Step 1: Ensure Docker Engine is present
 if ! command -v docker >/dev/null 2>&1; then
@@ -291,7 +343,10 @@ fi
 # Step 2: Ensure compose and buildx plugins are present
 install_docker_plugins
 
-# Step 3: Detect compose command (plugin should be installed by now, standalone as fallback)
+# Step 3: Enable linger so containers survive SSH disconnect
+enable_linger
+
+# Step 4: Detect compose command (plugin should be installed by now, standalone as fallback)
 if docker compose version >/dev/null 2>&1; then
     DC="docker compose"
 elif command -v docker-compose >/dev/null 2>&1; then

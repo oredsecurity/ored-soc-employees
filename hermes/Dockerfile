@@ -1,25 +1,26 @@
-# ORED Hermes SOC Agent
-# Autonomous AI SOC employee powered by Hermes Agent
-FROM node:20-slim AS base
+# ORED AI SOC Employee — Hermes Agent Container
+# Autonomous AI SOC analyst powered by Hermes Agent
+FROM python:3.12-slim
 
-# Install system deps
+# System dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git curl python3 python3-pip ca-certificates && \
+    git curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Hermes Agent
-RUN npm install -g hermes-agent
-
-# Install MCP SDK for native MCP client
-RUN pip install --no-cache-dir --break-system-packages mcp
+# Install Hermes Agent from source
+RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
+    cd /opt/hermes-agent && \
+    pip install --no-cache-dir -e "." && \
+    pip install --no-cache-dir mcp
 
 WORKDIR /root
 
-# Copy config and soul
-COPY config/ /root/.hermes/
+# Copy ORED SOC config and identity
+COPY config/config.yaml /root/.hermes/config.yaml
+COPY config/SOUL.md /root/.hermes/SOUL.md
 COPY skills/ /root/.hermes/skills/ored-soc/
 
-# The agent runs as a persistent process
-# In production, this will be triggered by cron or webhook
-CMD ["hermes-agent", "start"]
+# Default: run as Telegram gateway (persistent SOC employee)
+# Override CMD in docker-compose for other modes
+CMD ["hermes", "gateway"]

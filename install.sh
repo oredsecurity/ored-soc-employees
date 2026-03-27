@@ -65,10 +65,20 @@ echo ""
 info "Running pre-flight checks..."
 
 command -v docker >/dev/null 2>&1 || error "Docker is not installed. Install it first: https://docs.docker.com/get-docker/"
-command -v docker compose >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1 || error "Docker Compose is not installed."
+
+# Detect docker compose: plugin syntax first, standalone fallback
+if docker compose version >/dev/null 2>&1; then
+    DC="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    DC="docker-compose"
+else
+    error "Docker Compose is not installed. Install the docker-compose-plugin or standalone docker-compose."
+fi
 
 DOCKER_VERSION=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
+DC_VERSION=$($DC version --short 2>/dev/null || $DC version 2>/dev/null | head -1 || echo "unknown")
 info "Docker version: ${DOCKER_VERSION}"
+info "Compose command: ${DC} (${DC_VERSION})"
 
 # ── Environment setup ────────────────────────
 if [ ! -f .env ]; then
@@ -107,16 +117,16 @@ info "Environment validated."
 # ── Build & Launch ───────────────────────────
 if [ "$MCP_ONLY" = true ]; then
     info "Building MCP server container..."
-    docker compose build wazuh-mcp-server
+    $DC build wazuh-mcp-server
 
     info "Starting MCP server..."
-    docker compose up -d wazuh-mcp-server
+    $DC up -d wazuh-mcp-server
 else
     info "Building containers..."
-    docker compose --profile full build
+    $DC --profile full build
 
     info "Starting services..."
-    docker compose --profile full up -d
+    $DC --profile full up -d
 fi
 
 echo ""
@@ -124,11 +134,11 @@ info "Waiting for MCP server health check..."
 sleep 5
 
 # Check health
-if docker compose exec wazuh-mcp-server curl -sf http://localhost:3000/health >/dev/null 2>&1; then
+if $DC exec wazuh-mcp-server curl -sf http://localhost:3000/health >/dev/null 2>&1; then
     info "MCP server is healthy."
 else
     warn "MCP server health check pending — it may still be starting."
-    warn "Check status with: docker compose logs wazuh-mcp-server"
+    warn "Check status with: $DC logs wazuh-mcp-server"
 fi
 
 echo ""
@@ -142,15 +152,15 @@ echo -e "${BOLD}${GREEN}══════════════════�
 echo ""
 echo "  MCP Server:  http://localhost:${MCP_PORT:-3000}"
 echo "  Health:      http://localhost:${MCP_PORT:-3000}/health"
-echo "  Logs:        docker compose logs -f"
+echo "  Logs:        $DC logs -f"
 echo ""
 echo "  Useful commands:"
-echo "    docker compose logs -f wazuh-mcp-server  # MCP server logs"
+echo "    $DC logs -f wazuh-mcp-server  # MCP server logs"
 if [ "$MCP_ONLY" = false ]; then
-    echo "    docker compose logs -f hermes-agent       # Agent logs"
+    echo "    $DC logs -f hermes-agent       # Agent logs"
 fi
-echo "    docker compose restart                    # Restart all"
-echo "    docker compose down                       # Stop all"
+echo "    $DC restart                    # Restart all"
+echo "    $DC down                       # Stop all"
 echo ""
 if [ "$MCP_ONLY" = true ]; then
     echo "  To connect your native Hermes instance:"

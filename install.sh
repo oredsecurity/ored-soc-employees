@@ -265,7 +265,7 @@ install_docker_plugins() {
                 }
 
                 for plugin in "${MISSING_PLUGINS[@]}"; do
-                    if [ "$plugin" = "compose" ] && ! docker compose version >/dev/null 2>&1; then
+                    if [ "$plugin" = "compose" ]; then
                         info "Downloading docker-compose plugin..."
                         local COMPOSE_VERSION
                         COMPOSE_VERSION=$(get_latest_tag "https://api.github.com/repos/docker/compose/releases/latest")
@@ -281,7 +281,7 @@ install_docker_plugins() {
                         info "docker-compose plugin ${COMPOSE_VERSION} installed."
                     fi
 
-                    if [ "$plugin" = "buildx" ] && ! docker buildx version >/dev/null 2>&1; then
+                    if [ "$plugin" = "buildx" ]; then
                         info "Downloading docker-buildx plugin..."
                         local BUILDX_VERSION
                         BUILDX_VERSION=$(get_latest_tag "https://api.github.com/repos/docker/buildx/releases/latest")

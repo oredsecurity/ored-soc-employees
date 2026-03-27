@@ -187,6 +187,26 @@ docker_cmd() {
     fi
 }
 
+# ── Check if buildx version meets minimum ─────
+# compose v5+ requires buildx >= 0.17.0
+buildx_too_old() {
+    local MIN_MAJOR=0 MIN_MINOR=17
+    local version_str
+    version_str=$(docker_cmd buildx version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$version_str" ]; then
+        return 0  # missing = too old
+    fi
+    local major minor
+    major=$(echo "$version_str" | cut -d. -f1)
+    minor=$(echo "$version_str" | cut -d. -f2)
+    if [ "$major" -gt "$MIN_MAJOR" ]; then
+        return 1  # newer major = fine
+    elif [ "$major" -eq "$MIN_MAJOR" ] && [ "$minor" -ge "$MIN_MINOR" ]; then
+        return 1  # meets minimum
+    fi
+    return 0  # too old
+}
+
 # ── Install missing compose/buildx plugins ────
 install_docker_plugins() {
     local MISSING_PLUGINS=()
@@ -195,7 +215,7 @@ install_docker_plugins() {
         MISSING_PLUGINS+=("compose")
     fi
 
-    if ! docker_cmd buildx version >/dev/null 2>&1; then
+    if ! docker_cmd buildx version >/dev/null 2>&1 || buildx_too_old; then
         MISSING_PLUGINS+=("buildx")
     fi
 
@@ -203,7 +223,7 @@ install_docker_plugins() {
         return 0
     fi
 
-    info "Missing Docker plugins: ${MISSING_PLUGINS[*]}. Installing..."
+    info "Missing or outdated Docker plugins: ${MISSING_PLUGINS[*]}. Installing..."
     need_sudo
 
     case "$PKG_MGR" in

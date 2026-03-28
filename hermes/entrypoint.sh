@@ -59,6 +59,7 @@ fi
 # Telegram
 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> /root/.hermes/.env
 [ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> /root/.hermes/.env
+[ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}" >> /root/.hermes/.env
 
 echo "[entrypoint] ~/.hermes/.env keys:"
 grep -oP '^[^=]+' /root/.hermes/.env || true

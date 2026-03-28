@@ -11,8 +11,7 @@ RUN apt-get update && \
 # Install Hermes Agent from source
 RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    pip install --no-cache-dir -e "." && \
-    pip install --no-cache-dir mcp
+    pip install --no-cache-dir -e ".[messaging,cron,mcp]"
 
 WORKDIR /root
 

@@ -92,6 +92,7 @@ services:
       # Telegram approval interface
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
       # Internal networking
       - MCP_SERVER_URL=http://wazuh-mcp-server:3000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

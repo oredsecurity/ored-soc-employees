@@ -19,17 +19,16 @@ if [ -n "${LLM_API_KEY:-}" ]; then
     # Auto-detect provider from base URL if not explicitly set
     if [ -z "$PROVIDER" ] && [ -n "${LLM_BASE_URL:-}" ]; then
         case "$LLM_BASE_URL" in
-            *anthropic*)    PROVIDER="anthropic" ;;
-            *minimax.io*)   PROVIDER="minimax" ;;
-            *minimaxi.com*) PROVIDER="minimax-cn" ;;
-            *openrouter*)   PROVIDER="openrouter" ;;
-            *deepseek*)     PROVIDER="deepseek" ;;
-            *)              PROVIDER="openai" ;;
+            *anthropic.com*)    PROVIDER="anthropic" ;;
+            *openrouter*)       PROVIDER="openrouter" ;;
+            # Custom base URL (minimax.chat/v1, deepseek, etc.) = OpenAI-compatible
+            # Use OPENAI_API_KEY + OPENAI_BASE_URL so Hermes treats it as custom endpoint
+            *)                  PROVIDER="openai" ;;
         esac
     fi
 
-    # Auto-detect provider from model name as fallback
-    if [ -z "$PROVIDER" ] && [ -n "${LLM_MODEL:-}" ]; then
+    # Auto-detect provider from model name (only if no base URL, meaning use native provider)
+    if [ -z "$PROVIDER" ] && [ -z "${LLM_BASE_URL:-}" ]; then
         case "$LLM_MODEL" in
             MiniMax*|minimax*)  PROVIDER="minimax" ;;
             claude*|Claude*)    PROVIDER="anthropic" ;;
@@ -79,8 +78,8 @@ if [ -n "${LLM_MODEL:-}" ]; then
     fi
 fi
 
-# Set provider if detected
-if [ -n "${PROVIDER:-}" ]; then
+# Set provider if detected (skip for "openai" — Hermes auto-detects from OPENAI_API_KEY)
+if [ -n "${PROVIDER:-}" ] && [ "$PROVIDER" != "openai" ]; then
     if grep -q '^provider:' /tmp/hermes-config.yaml 2>/dev/null; then
         sed -i "s|^provider:.*|provider: \"${PROVIDER}\"|" /tmp/hermes-config.yaml
     else

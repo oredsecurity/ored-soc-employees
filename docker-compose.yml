@@ -88,6 +88,7 @@ services:
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
       # Telegram approval interface
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
@@ -100,7 +101,7 @@ services:
       # Mount custom skills
       - ./hermes/skills:/root/.hermes/skills/ored-soc:ro
       # Mount custom config
-      - ./hermes/config/config.yaml:/root/.hermes/config.yaml:ro
+      - ./hermes/config/config.yaml:/root/.hermes/config.yaml
       - ./hermes/config/SOUL.md:/root/.hermes/SOUL.md:ro
     networks:
       - ored-soc

@@ -21,6 +21,10 @@ COPY config/config.yaml /root/.hermes/config.yaml
 COPY config/SOUL.md /root/.hermes/SOUL.md
 COPY skills/ /root/.hermes/skills/ored-soc/
 
+# Entrypoint: writes env vars to ~/.hermes/.env before starting
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+
 # Default: run as Telegram gateway (persistent SOC employee)
-# Override CMD in docker-compose for other modes
 CMD ["hermes", "gateway"]

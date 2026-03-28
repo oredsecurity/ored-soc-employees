@@ -1,42 +1,33 @@
 #!/bin/sh
 set -e
 
-# Write environment variables to ~/.hermes/.env so Hermes gateway can read them.
-# Docker compose passes env vars from the host .env, but Hermes reads from
-# ~/.hermes/.env inside the container. This bridge script maps between them.
+# ─────────────────────────────────────────────────────────────────────
+# ORED SOC Employee — Container Entrypoint
+# Bridges generic .env vars (LLM_API_KEY) to Hermes-specific config
+# (~/.hermes/.env and ~/.hermes/config.yaml)
+# ─────────────────────────────────────────────────────────────────────
+
 mkdir -p /root/.hermes
 
-# Start fresh
+# ── 1. Build ~/.hermes/.env ──────────────────────────────────────────
 > /root/.hermes/.env
 
-# Map LLM_API_KEY to the correct provider-specific env var.
-# Hermes expects provider-specific names, not a generic LLM_API_KEY.
-# We detect the provider from LLM_BASE_URL or LLM_PROVIDER, and fall back
-# to OPENAI_API_KEY (which works with OpenRouter and OpenAI-compatible APIs).
 if [ -n "${LLM_API_KEY:-}" ]; then
     PROVIDER="${LLM_PROVIDER:-}"
 
-    # Auto-detect provider from base URL if not explicitly set
-    if [ -z "$PROVIDER" ] && [ -n "${LLM_BASE_URL:-}" ]; then
-        case "$LLM_BASE_URL" in
-            *anthropic.com*)    PROVIDER="anthropic" ;;
-            *openrouter*)       PROVIDER="openrouter" ;;
-            # Custom base URL (minimax.chat/v1, deepseek, etc.) = OpenAI-compatible
-            # Use OPENAI_API_KEY + OPENAI_BASE_URL so Hermes treats it as custom endpoint
-            *)                  PROVIDER="openai" ;;
-        esac
-    fi
-
-    # Auto-detect provider from model name (only if no base URL, meaning use native provider)
-    if [ -z "$PROVIDER" ] && [ -z "${LLM_BASE_URL:-}" ]; then
-        case "$LLM_MODEL" in
-            MiniMax*|minimax*)  PROVIDER="minimax" ;;
-            claude*|Claude*)    PROVIDER="anthropic" ;;
+    # Fallback: auto-detect from model name if provider not set
+    if [ -z "$PROVIDER" ]; then
+        case "${LLM_MODEL:-}" in
+            MiniMax*|minimax*)   PROVIDER="minimax" ;;
+            claude*|Claude*)     PROVIDER="anthropic" ;;
             deepseek*|DeepSeek*) PROVIDER="deepseek" ;;
+            gpt-*|o1-*|o3-*|o4-*) PROVIDER="openai" ;;
+            *)                   PROVIDER="openai" ;;
         esac
+        echo "[entrypoint] LLM_PROVIDER not set, auto-detected: ${PROVIDER}"
     fi
 
-    # Write the correct env var name for the detected provider
+    # Map generic LLM_API_KEY to the provider-specific env var Hermes expects
     case "$PROVIDER" in
         anthropic)
             echo "ANTHROPIC_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
@@ -50,26 +41,35 @@ if [ -n "${LLM_API_KEY:-}" ]; then
         deepseek)
             echo "DEEPSEEK_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
             ;;
+        openrouter)
+            echo "OPENROUTER_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
+            ;;
         *)
-            # Default: OPENAI_API_KEY works for OpenRouter and any OpenAI-compatible API
+            # openai or any OpenAI-compatible provider
             echo "OPENAI_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
             ;;
     esac
 fi
 
-# Pass through base URL if set
-[ -n "${LLM_BASE_URL:-}" ] && echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> /root/.hermes/.env
+# Base URL (for custom endpoints)
+if [ -n "${LLM_BASE_URL:-}" ]; then
+    echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> /root/.hermes/.env
+fi
 
-# Config.yaml is mounted read-only, so we copy it and patch the copy
-# The volume mount puts it at /root/.hermes/config.yaml (ro)
-# We copy to a temp location, patch it, then replace
+# Telegram
+[ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> /root/.hermes/.env
+[ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> /root/.hermes/.env
+
+echo "[entrypoint] ~/.hermes/.env keys:"
+grep -oP '^[^=]+' /root/.hermes/.env || true
+
+# ── 2. Patch config.yaml with model and provider ────────────────────
 if [ -f /root/.hermes/config.yaml ]; then
     cp /root/.hermes/config.yaml /tmp/hermes-config.yaml
 else
     echo "" > /tmp/hermes-config.yaml
 fi
 
-# Set model if LLM_MODEL is provided
 if [ -n "${LLM_MODEL:-}" ]; then
     if grep -q '^model:' /tmp/hermes-config.yaml 2>/dev/null; then
         sed -i "s|^model:.*|model: \"${LLM_MODEL}\"|" /tmp/hermes-config.yaml
@@ -78,7 +78,6 @@ if [ -n "${LLM_MODEL:-}" ]; then
     fi
 fi
 
-# Set provider if detected (skip for "openai" — Hermes auto-detects from OPENAI_API_KEY)
 if [ -n "${PROVIDER:-}" ] && [ "$PROVIDER" != "openai" ]; then
     if grep -q '^provider:' /tmp/hermes-config.yaml 2>/dev/null; then
         sed -i "s|^provider:.*|provider: \"${PROVIDER}\"|" /tmp/hermes-config.yaml
@@ -87,20 +86,10 @@ if [ -n "${PROVIDER:-}" ] && [ "$PROVIDER" != "openai" ]; then
     fi
 fi
 
-# Replace the read-only mount with our patched version
-cp -f /tmp/hermes-config.yaml /root/.hermes/config.yaml 2>/dev/null || {
-    # If ro mount blocks cp, use bind mount workaround
-    mount --bind /tmp/hermes-config.yaml /root/.hermes/config.yaml 2>/dev/null || true
-}
+cp -f /tmp/hermes-config.yaml /root/.hermes/config.yaml 2>/dev/null || true
 
-echo "[entrypoint] Config:"
+echo "[entrypoint] config.yaml:"
 cat /root/.hermes/config.yaml
 
-# Telegram credentials
-[ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> /root/.hermes/.env
-[ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> /root/.hermes/.env
-
-echo "[entrypoint] Wrote /root/.hermes/.env with keys:"
-grep -oP '^[^=]+' /root/.hermes/.env
-
+# ── 3. Hand off to CMD ──────────────────────────────────────────────
 exec "$@"

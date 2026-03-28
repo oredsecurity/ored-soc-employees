@@ -9,8 +9,25 @@ set -e
 
 mkdir -p /root/.hermes
 
+# Helper: strip surrounding quotes from a value
+strip_quotes() {
+    local val="$1"
+    val="${val#\"}" ; val="${val%\"}"
+    val="${val#\'}" ; val="${val%\'}"
+    echo "$val"
+}
+
 # ── 1. Build ~/.hermes/.env ──────────────────────────────────────────
 > /root/.hermes/.env
+
+# Strip quotes from all credential values (users often quote .env values)
+LLM_API_KEY=$(strip_quotes "${LLM_API_KEY:-}")
+LLM_BASE_URL=$(strip_quotes "${LLM_BASE_URL:-}")
+LLM_MODEL=$(strip_quotes "${LLM_MODEL:-}")
+LLM_PROVIDER=$(strip_quotes "${LLM_PROVIDER:-}")
+TELEGRAM_BOT_TOKEN=$(strip_quotes "${TELEGRAM_BOT_TOKEN:-}")
+TELEGRAM_CHAT_ID=$(strip_quotes "${TELEGRAM_CHAT_ID:-}")
+TELEGRAM_ALLOWED_USERS=$(strip_quotes "${TELEGRAM_ALLOWED_USERS:-}")
 
 if [ -n "${LLM_API_KEY:-}" ]; then
     PROVIDER="${LLM_PROVIDER:-}"

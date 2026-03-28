@@ -422,11 +422,14 @@ if [ ! -f .env ]; then
     warn ".env created. You MUST edit it with your credentials before continuing."
     echo ""
     warn "Required:"
-    warn "  WAZUH_HOST     — Your Wazuh manager URL"
-    warn "  WAZUH_USER     — Wazuh API username"
-    warn "  WAZUH_PASS     — Wazuh API password"
+    warn "  WAZUH_HOST              — Your Wazuh manager URL"
+    warn "  WAZUH_USER              — Wazuh API username"
+    warn "  WAZUH_PASS              — Wazuh API password"
     if [ "$MCP_ONLY" = false ]; then
-        warn "  LLM_API_KEY    — API key for your LLM provider"
+        warn "  LLM_API_KEY             — API key for your LLM provider"
+        warn "  TELEGRAM_BOT_TOKEN      — Bot token from @BotFather"
+        warn "  TELEGRAM_CHAT_ID        — Your Telegram user ID (message @userinfobot to get it)"
+        warn "  TELEGRAM_ALLOWED_USERS  — Comma-separated user IDs allowed to talk to the bot"
     fi
     echo ""
     read -rp "Press Enter after editing .env, or Ctrl+C to abort... "
@@ -445,6 +448,26 @@ source .env 2>/dev/null || true
 if [ "$MCP_ONLY" = false ]; then
     [ -z "${LLM_API_KEY:-}" ] && error "LLM_API_KEY is not set in .env (required for full-stack mode)"
     [ "${LLM_API_KEY:-}" = "***" ] && error "LLM_API_KEY is still the placeholder — update it in .env"
+
+    # Telegram validation
+    [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && error "TELEGRAM_BOT_TOKEN is not set in .env (required for full-stack mode)"
+
+    if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+        warn "TELEGRAM_CHAT_ID not set. The bot will start but has no home channel for notifications."
+    fi
+
+    # Auto-default TELEGRAM_ALLOWED_USERS from TELEGRAM_CHAT_ID
+    if [ -z "${TELEGRAM_ALLOWED_USERS:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+        warn "TELEGRAM_ALLOWED_USERS not set. Defaulting to TELEGRAM_CHAT_ID (${TELEGRAM_CHAT_ID})."
+        # Write it into .env so docker-compose picks it up
+        echo "" >> .env
+        echo "# Auto-set by installer" >> .env
+        echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_CHAT_ID}" >> .env
+        export TELEGRAM_ALLOWED_USERS="${TELEGRAM_CHAT_ID}"
+    elif [ -z "${TELEGRAM_ALLOWED_USERS:-}" ]; then
+        warn "TELEGRAM_ALLOWED_USERS not set. The bot will reject all messages."
+        warn "Set it to your Telegram user ID after install."
+    fi
 fi
 
 info "Environment validated."
@@ -502,5 +525,9 @@ if [ "$MCP_ONLY" = true ]; then
     echo "    Add to ~/.hermes/config.yaml under mcp_servers:"
     echo "      wazuh:"
     echo "        url: http://localhost:${MCP_PORT:-3000}/mcp"
+    echo ""
+else
+    echo -e "  ${CYAN}Next step:${RESET} Message your Telegram bot to verify it's working."
+    echo "  Try: \"Show me the latest Wazuh alerts\""
     echo ""
 fi

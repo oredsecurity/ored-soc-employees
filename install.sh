@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ═══════════════════════════════════════════════
-# ORED AI SOC Employees — Quick Install
-# ═══════════════════════════════════════════════
+# ===============================================
+# ORED AI SOC Employees: Quick Install
+# ===============================================
 # Usage:
 #   git clone https://github.com/oredsecurity/ored-soc-employees.git
 #   cd ored-soc-employees
-#
-#   ./install.sh              # Full stack: MCP server + Hermes agent
-#   ./install.sh --mcp-only   # MCP server only (Hermes installed natively)
+#   ./install.sh
 #
 # Supported distros:
 #   - Amazon Linux 2023 (dnf)
@@ -26,11 +24,12 @@ set -euo pipefail
 #   2. Installs curl if missing
 #   3. Installs Docker Engine if missing
 #   4. Installs docker-compose-plugin and docker-buildx-plugin if missing
-#      (Amazon Linux ships Docker CE without these)
 #   5. Enables loginctl linger so containers survive SSH disconnect
 #   6. Detects compose command: "docker compose" (plugin) or "docker-compose" (standalone)
-#   7. Validates .env configuration
-#   8. Builds and launches the stack
+#   7. Installs Hermes (Claude Code) natively if not in PATH
+#   8. Validates .env configuration
+#   9. Builds and launches the MCP server container
+#  10. Waits for health check
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -43,46 +42,32 @@ info()  { echo -e "${GREEN}[INFO]${RESET} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 error() { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
 
-# ── Parse flags ─────────────────────────────
-MCP_ONLY=false
+# Parse flags
 for arg in "$@"; do
     case "$arg" in
-        --mcp-only) MCP_ONLY=true ;;
         -h|--help)
             echo "Usage: ./install.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --mcp-only   Run MCP server only (for hosts with Hermes installed natively)"
             echo "  -h, --help   Show this help"
             echo ""
-            echo "Modes:"
-            echo "  Full stack:  ./install.sh            Runs wazuh-mcp-server + hermes-agent"
-            echo "  MCP only:    ./install.sh --mcp-only  Runs wazuh-mcp-server only"
+            echo "Installs the MCP server (Docker) and Hermes agent (native)."
             exit 0
             ;;
         *) error "Unknown option: $arg (use --help for usage)" ;;
     esac
 done
 
-if [ "$MCP_ONLY" = true ]; then
-    MODE_LABEL="MCP Server Only"
-    MODE_DESC="Hermes agent will NOT be started (assumes native install on host)"
-else
-    MODE_LABEL="Full Stack"
-    MODE_DESC="MCP server + Hermes agent containers"
-fi
-
 echo -e "${BOLD}"
 echo "╔══════════════════════════════════════════╗"
-echo "║   ORED AI SOC Employees — Installer     ║"
+echo "║   ORED AI SOC Employees: Installer      ║"
 echo "║   Autonomous Security Operations        ║"
 echo "╚══════════════════════════════════════════╝"
 echo -e "${RESET}"
-echo -e "  Mode: ${CYAN}${MODE_LABEL}${RESET}"
-echo -e "  ${MODE_DESC}"
+echo -e "  MCP server via Docker, Hermes agent native"
 echo ""
 
-# ── OS Detection ──────────────────────────────
+# == OS Detection ============================================
 detect_os() {
     if [ -f /etc/os-release ]; then
         # shellcheck disable=SC1091
@@ -111,7 +96,7 @@ detect_os() {
     info "Package manager: ${PKG_MGR}"
 }
 
-# ── Ensure root/sudo ─────────────────────────
+# == Ensure root/sudo ========================================
 need_sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         SUDO=""
@@ -122,7 +107,7 @@ need_sudo() {
     fi
 }
 
-# ── Install Docker Engine if missing ──────────
+# == Install Docker Engine if missing ========================
 install_docker() {
     info "Docker not found. Installing Docker Engine..."
     need_sudo
@@ -173,7 +158,7 @@ https://download.docker.com/linux/${OS_ID} $(. /etc/os-release && echo "$VERSION
     info "Docker installed successfully."
 }
 
-# ── Docker command wrapper ────────────────────
+# == Docker command wrapper ==================================
 # After installing Docker + adding user to docker group, the current
 # shell doesn't have the new group yet. Use sudo as fallback when
 # the socket isn't accessible.
@@ -187,7 +172,7 @@ docker_cmd() {
     fi
 }
 
-# ── Check if buildx version meets minimum ─────
+# == Check if buildx version meets minimum ===================
 # compose v5+ requires buildx >= 0.17.0
 buildx_too_old() {
     local MIN_MAJOR=0 MIN_MINOR=17
@@ -207,7 +192,7 @@ buildx_too_old() {
     return 0  # too old
 }
 
-# ── Install missing compose/buildx plugins ────
+# == Install missing compose/buildx plugins ==================
 install_docker_plugins() {
     local MISSING_PLUGINS=()
 
@@ -256,8 +241,6 @@ install_docker_plugins() {
 
                 # Helper: fetch latest GitHub release tag without triggering
                 # broken-pipe errors under set -o pipefail.
-                # curl | grep | head causes curl to get SIGPIPE when head exits.
-                # Instead, capture full output first, then parse.
                 get_latest_tag() {
                     local api_response
                     api_response=$(curl -fsSL "$1" 2>/dev/null) || true
@@ -328,7 +311,7 @@ install_docker_plugins() {
     info "Docker plugins installed successfully."
 }
 
-# ── Install base prerequisites (curl) ─────────
+# == Install base prerequisites (curl) =======================
 install_prereqs() {
     local NEED_INSTALL=false
 
@@ -347,7 +330,92 @@ install_prereqs() {
     fi
 }
 
-# ── Enable linger for current user ────────────
+# == Install Python3 if missing ==============================
+install_python3() {
+    if command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    info "Python3 not found. Installing..."
+    need_sudo
+
+    case "$PKG_MGR" in
+        dnf|yum) $SUDO $PKG_MGR install -y python3 python3-pip python3-venv ;;
+        apt)     $SUDO apt-get update -y && $SUDO apt-get install -y python3 python3-pip python3-venv ;;
+        *)       error "Cannot install python3 automatically. Install it manually and re-run." ;;
+    esac
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        error "Python3 installation failed. Install it manually."
+    fi
+
+    info "Python3 installed."
+}
+
+# == Install Hermes (Claude Code) natively ====================
+install_hermes() {
+    if command -v hermes >/dev/null 2>&1; then
+        local hermes_ver
+        hermes_ver=$(hermes --version 2>/dev/null || echo "unknown")
+        info "Hermes already installed: ${hermes_ver}"
+        return 0
+    fi
+
+    info "Hermes not found. Installing natively..."
+
+    # Ensure Python3 is available
+    install_python3
+
+    # Ensure git is available
+    if ! command -v git >/dev/null 2>&1; then
+        info "Installing git..."
+        need_sudo
+        case "$PKG_MGR" in
+            dnf|yum) $SUDO $PKG_MGR install -y git ;;
+            apt)     $SUDO apt-get update -y && $SUDO apt-get install -y git ;;
+            *)       error "Cannot install git automatically. Install it manually and re-run." ;;
+        esac
+    fi
+
+    local HERMES_DIR="${HOME}/.hermes/hermes-agent"
+
+    # Clone if not already present
+    if [ ! -d "$HERMES_DIR" ]; then
+        info "Cloning Hermes Agent..."
+        mkdir -p "${HOME}/.hermes"
+        git clone https://github.com/NousResearch/hermes-agent.git "$HERMES_DIR"
+    else
+        info "Hermes source already cloned, pulling latest..."
+        git -C "$HERMES_DIR" pull || warn "Could not pull latest, using existing source."
+    fi
+
+    # Create venv and install
+    info "Setting up Python virtual environment..."
+    cd "$HERMES_DIR"
+    python3 -m venv venv
+    ./venv/bin/pip install --upgrade pip
+    ./venv/bin/pip install -e .
+    cd - >/dev/null
+
+    # Create symlink
+    mkdir -p "${HOME}/.local/bin"
+    ln -sf "${HERMES_DIR}/venv/bin/hermes" "${HOME}/.local/bin/hermes"
+
+    # Ensure ~/.local/bin is in PATH for verification
+    export PATH="${HOME}/.local/bin:${PATH}"
+
+    # Verify
+    if command -v hermes >/dev/null 2>&1; then
+        local hermes_ver
+        hermes_ver=$(hermes --version 2>/dev/null || echo "unknown")
+        info "Hermes installed successfully: ${hermes_ver}"
+    else
+        warn "Hermes installed but not found in PATH."
+        warn "Add this to your shell profile: export PATH=\"\${HOME}/.local/bin:\${PATH}\""
+    fi
+}
+
+# == Enable linger for current user ==========================
 # Without linger, systemd kills user processes (including containers)
 # when the SSH session disconnects. This makes containers persistent.
 enable_linger() {
@@ -371,26 +439,28 @@ enable_linger() {
     info "Linger enabled."
 }
 
-# ── Pre-flight checks ────────────────────────
+# ============================================================
+# Main installation flow
+# ============================================================
+
 info "Running pre-flight checks..."
 detect_os
 
-# Step 0: Base prerequisites
+# Step 1: Base prerequisites
 install_prereqs
 
-# Step 1: Ensure Docker Engine is present
+# Step 2: Ensure Docker Engine is present
 if ! command -v docker >/dev/null 2>&1; then
     install_docker
 fi
 
-# Step 2: Ensure compose and buildx plugins are present
+# Step 3: Ensure compose and buildx plugins are present
 install_docker_plugins
 
-# Step 3: Enable linger so containers survive SSH disconnect
+# Step 4: Enable linger so containers survive SSH disconnect
 enable_linger
 
-# Step 4: Determine if sudo is needed for docker commands
-# (user may have been added to docker group but current shell doesn't have it yet)
+# Step 5: Determine if sudo is needed for docker commands
 DOCKER="docker"
 if ! docker version >/dev/null 2>&1; then
     if [ "$(id -u)" -ne 0 ] && sudo docker version >/dev/null 2>&1; then
@@ -399,7 +469,7 @@ if ! docker version >/dev/null 2>&1; then
     fi
 fi
 
-# Step 5: Detect compose command (plugin should be installed by now, standalone as fallback)
+# Step 6: Detect compose command (plugin should be installed by now, standalone as fallback)
 if $DOCKER compose version >/dev/null 2>&1; then
     DC="$DOCKER compose"
 elif command -v docker-compose >/dev/null 2>&1; then
@@ -415,97 +485,54 @@ info "Docker version: ${DOCKER_VERSION}"
 info "Compose: ${DC} (${DC_VERSION})"
 info "Buildx: ${BUILDX_VERSION}"
 
-# ── Environment setup ────────────────────────
+# Step 7: Install Hermes (Claude Code) natively
+install_hermes
+
+# == Environment setup =======================================
 if [ ! -f .env ]; then
     info "Creating .env from template..."
     cp .env.example .env
     warn ".env created. You MUST edit it with your credentials before continuing."
     echo ""
     warn "Required:"
-    warn "  WAZUH_HOST              — Your Wazuh manager URL"
-    warn "  WAZUH_USER              — Wazuh API username"
-    warn "  WAZUH_PASS              — Wazuh API password"
-    if [ "$MCP_ONLY" = false ]; then
-        warn "  LLM_API_KEY             — API key for your LLM provider"
-        warn "  TELEGRAM_BOT_TOKEN      — Bot token from @BotFather"
-        warn "  TELEGRAM_CHAT_ID        — Your Telegram user ID (message @userinfobot to get it)"
-        warn "  TELEGRAM_ALLOWED_USERS  — Comma-separated user IDs allowed to talk to the bot"
-    fi
+    warn "  WAZUH_HOST              Your Wazuh manager URL"
+    warn "  WAZUH_USER              Wazuh API username"
+    warn "  WAZUH_PASS              Wazuh API password"
     echo ""
     read -rp "Press Enter after editing .env, or Ctrl+C to abort... "
 else
     info ".env already exists, using existing configuration."
 fi
 
-# ── Validate required vars ───────────────────
+# == Validate required vars ==================================
 source .env 2>/dev/null || true
 
 [ -z "${WAZUH_HOST:-}" ] && error "WAZUH_HOST is not set in .env"
 [ -z "${WAZUH_USER:-}" ] && error "WAZUH_USER is not set in .env"
 [ -z "${WAZUH_PASS:-}" ] && error "WAZUH_PASS is not set in .env"
-[ "${WAZUH_PASS:-}" = "CHANGE_ME" ] && error "WAZUH_PASS is still set to CHANGE_ME — update it in .env"
-
-if [ "$MCP_ONLY" = false ]; then
-    [ -z "${LLM_API_KEY:-}" ] && error "LLM_API_KEY is not set in .env (required for full-stack mode)"
-    [ "${LLM_API_KEY:-}" = "***" ] && error "LLM_API_KEY is still the placeholder — update it in .env"
-
-    # Telegram validation
-    [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && error "TELEGRAM_BOT_TOKEN is not set in .env (required for full-stack mode)"
-
-    if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-        warn "TELEGRAM_CHAT_ID not set. The bot will start but has no home channel for notifications."
-    fi
-
-    # Auto-default TELEGRAM_ALLOWED_USERS from TELEGRAM_CHAT_ID
-    if [ -z "${TELEGRAM_ALLOWED_USERS:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        warn "TELEGRAM_ALLOWED_USERS not set. Defaulting to TELEGRAM_CHAT_ID (${TELEGRAM_CHAT_ID})."
-        # Write it into .env so docker-compose picks it up
-        echo "" >> .env
-        echo "# Auto-set by installer" >> .env
-        echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_CHAT_ID}" >> .env
-        export TELEGRAM_ALLOWED_USERS="${TELEGRAM_CHAT_ID}"
-    elif [ -z "${TELEGRAM_ALLOWED_USERS:-}" ]; then
-        warn "TELEGRAM_ALLOWED_USERS not set. The bot will reject all messages."
-        warn "Set it to your Telegram user ID after install."
-    fi
-fi
+[ "${WAZUH_PASS:-}" = "CHANGE_ME" ] && error "WAZUH_PASS is still set to CHANGE_ME, update it in .env"
 
 info "Environment validated."
 
-# ── Build & Launch ───────────────────────────
-if [ "$MCP_ONLY" = true ]; then
-    info "Building MCP server container..."
-    $DC build wazuh-mcp-server
-
-    info "Starting MCP server..."
-    $DC up -d wazuh-mcp-server
-else
-    info "Building containers..."
-    $DC --profile full build
-
-    info "Starting services..."
-    $DC --profile full up -d
-fi
+# == Build & Launch ==========================================
+info "Building MCP server container..."
+$DC up -d --build
 
 echo ""
 info "Waiting for MCP server health check..."
 sleep 5
 
 # Check health
-if $DC exec wazuh-mcp-server curl -sf http://localhost:3000/health >/dev/null 2>&1; then
+if $DC exec wazuh-mcp curl -sf http://localhost:3000/health >/dev/null 2>&1; then
     info "MCP server is healthy."
 else
-    warn "MCP server health check pending — it may still be starting."
-    warn "Check status with: $DC logs wazuh-mcp-server"
+    warn "MCP server health check pending, it may still be starting."
+    warn "Check status with: $DC logs wazuh-mcp"
 fi
 
 echo ""
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
-if [ "$MCP_ONLY" = true ]; then
-    echo -e "${BOLD}${GREEN}  ORED MCP Server is running!${RESET}"
-else
-    echo -e "${BOLD}${GREEN}  ORED AI SOC Employee is running!${RESET}"
-fi
+echo -e "${BOLD}${GREEN}  ORED SOC Employees: Install Complete${RESET}"
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════${RESET}"
 echo ""
 echo "  MCP Server:  http://localhost:${MCP_PORT:-3000}"
@@ -513,21 +540,17 @@ echo "  Health:      http://localhost:${MCP_PORT:-3000}/health"
 echo "  Logs:        $DC logs -f"
 echo ""
 echo "  Useful commands:"
-echo "    $DC logs -f wazuh-mcp-server  # MCP server logs"
-if [ "$MCP_ONLY" = false ]; then
-    echo "    $DC logs -f hermes-agent       # Agent logs"
-fi
-echo "    $DC restart                    # Restart all"
-echo "    $DC down                       # Stop all"
+echo "    $DC logs -f wazuh-mcp        # MCP server logs"
+echo "    $DC restart                  # Restart MCP server"
+echo "    $DC down                     # Stop MCP server"
 echo ""
-if [ "$MCP_ONLY" = true ]; then
-    echo "  To connect your native Hermes instance:"
-    echo "    Add to ~/.hermes/config.yaml under mcp_servers:"
-    echo "      wazuh:"
-    echo "        url: http://localhost:${MCP_PORT:-3000}/mcp"
-    echo ""
-else
-    echo -e "  ${CYAN}Next step:${RESET} Message your Telegram bot to verify it's working."
-    echo "  Try: \"Show me the latest Wazuh alerts\""
-    echo ""
-fi
+echo -e "  ${CYAN}Next steps:${RESET}"
+echo "    1. Provision a tenant profile:"
+echo "       ./scripts/provision-tenant.sh <client-slug> --wazuh-url <url> --wazuh-pass <pass> --llm-api-key <key>"
+echo ""
+echo "    2. Start Hermes with the profile:"
+echo "       hermes --profile <client-slug>"
+echo ""
+echo "    Ensure ~/.local/bin is in your PATH:"
+echo "      export PATH=\"\${HOME}/.local/bin:\${PATH}\""
+echo ""

@@ -8,3 +8,4 @@ node_modules/
 hermes-data/
 .hermes/
 docs/internal/
+upstream-pr/

@@ -1,25 +1,18 @@
-# ORED AI SOC Employees — Docker Compose Stack
+# ORED AI SOC Employees — MCP Server
 # https://github.com/oredsecurity/ored-soc-employees
 #
-# Two deployment modes:
+# Runs the hardened Wazuh MCP server. Hermes agent runs natively
+# on the host using profiles for tenant isolation.
 #
-#   Mode 1 — Full stack (MCP server + Hermes agent):
-#     docker compose up -d
+# Quick start:
+#   cp .env.example .env    # fill in Wazuh credentials
+#   docker compose up -d
 #
-#   Mode 2 — MCP server only (Hermes installed natively on host):
-#     docker compose up -d wazuh-mcp-server
-#
-# Prerequisites:
-#   - A running Wazuh instance (manager + API accessible)
-#   - Docker & Docker Compose installed
-#   - .env file configured (copy from .env.example)
+# Multi-tenant: use scripts/provision-tenant.sh instead.
+# It generates a per-tenant compose with isolated ports and config.
 
 services:
-  # ─────────────────────────────────────────────
-  # Wazuh MCP Server (forked + ORED hardening)
-  # Exposes 48+ Wazuh tools via MCP protocol
-  # ─────────────────────────────────────────────
-  wazuh-mcp-server:
+  wazuh-mcp:
     build:
       context: ./mcp-server
       dockerfile: Dockerfile
@@ -27,33 +20,9 @@ services:
     restart: unless-stopped
     ports:
       - "${MCP_PORT:-3000}:3000"
-    environment:
-      # Wazuh API connection
-      - WAZUH_HOST=${WAZUH_HOST}
-      - WAZUH_PORT=${WAZUH_PORT:-55000}
-      - WAZUH_USER=${WAZUH_USER}
-      - WAZUH_PASS=${WAZUH_PASS}
-      - WAZUH_VERIFY_SSL=${WAZUH_VERIFY_SSL:-false}
-      # MCP server config
-      - MCP_HOST=0.0.0.0
-      - MCP_PORT=3000
-      - AUTH_MODE=${MCP_AUTH_MODE:-none}
-      - AUTH_SECRET_KEY=${MCP_AUTH_SECRET:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # Alert polling
-      - ORED_POLL_ENABLED=${ORED_POLL_ENABLED:-true}
-      - ORED_POLL_INTERVAL=${ORED_POLL_INTERVAL:-60}
-      - ORED_POLL_MIN_LEVEL=${ORED_POLL_MIN_LEVEL:-5}
-      - ORED_POLL_BATCH_SIZE=${ORED_POLL_BATCH_SIZE:-100}
-      # Wazuh Indexer (optional, for vuln tools on Wazuh 4.8+)
-      - WAZUH_INDEXER_HOST=${WAZUH_INDEXER_HOST:-}
-      - WAZUH_INDEXER_PORT=${WAZUH_INDEXER_PORT:-9200}
-      - WAZUH_INDEXER_USER=${WAZUH_INDEXER_USER:-}
-      - WAZUH_INDEXER_PASS=${WAZUH_INDEXER_PASS:-}
-    networks:
-      - ored-soc
+    env_file: .env
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -63,60 +32,3 @@ services:
         limits:
           memory: 512M
           cpus: "0.5"
-
-  # ─────────────────────────────────────────────
-  # Hermes Agent (the SOC employee brain)
-  # Connects to MCP server, processes alerts,
-  # requests approvals, takes action
-  #
-  # Omit this service when Hermes is installed
-  # natively: docker compose up -d wazuh-mcp-server
-  # ─────────────────────────────────────────────
-  hermes-agent:
-    build:
-      context: ./hermes
-      dockerfile: Dockerfile
-    container_name: ored-hermes-agent
-    restart: unless-stopped
-    profiles:
-      - full
-    depends_on:
-      wazuh-mcp-server:
-        condition: service_healthy
-    environment:
-      # LLM backend (any OpenAI-compatible provider)
-      - LLM_API_KEY=${LLM_API_KEY}
-      - LLM_BASE_URL=${LLM_BASE_URL:-}
-      - LLM_MODEL=${LLM_MODEL:-}
-      - LLM_PROVIDER=${LLM_PROVIDER:-}
-      # Telegram approval interface
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
-      # Internal networking
-      - MCP_SERVER_URL=http://wazuh-mcp-server:3000
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      # Persistent memory and skills (survive container restarts)
-      - hermes-data:/root/.hermes
-      # Mount custom skills
-      - ./hermes/skills:/root/.hermes/skills/ored-soc:ro
-      # Mount custom config
-      - ./hermes/config/config.yaml:/root/.hermes/config.yaml
-      - ./hermes/config/SOUL.md:/root/.hermes/SOUL.md:ro
-    networks:
-      - ored-soc
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-          cpus: "1.0"
-
-networks:
-  ored-soc:
-    name: ored-soc-network
-    driver: bridge
-
-volumes:
-  hermes-data:
-    name: ored-hermes-data

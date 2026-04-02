@@ -1,8 +1,0 @@
-# ORED SOC Employee — Hermes Agent Configuration
-# Model and provider are set by entrypoint.sh from environment variables
-
-mcp_servers:
-  wazuh:
-    url: "http://wazuh-mcp-server:3000/mcp"
-    timeout: 120
-    connect_timeout: 30

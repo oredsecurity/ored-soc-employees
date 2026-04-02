@@ -1,0 +1,12 @@
+name: ored-soc-policy
+version: "1.0.0"
+description: >
+  ORED Security action policy enforcement for AI SOC employees.
+  Classifies every MCP tool call as auto-allowed, approval-required,
+  or forbidden. Blocks forbidden actions, gates dangerous actions
+  behind human approval, and logs everything.
+author: ORED Labs
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start

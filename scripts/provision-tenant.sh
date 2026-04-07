@@ -260,12 +260,8 @@ info "Starting SOC agent stack for client: ${CLIENT_SLUG}..."
 
 cd "$CLIENT_DIR"
 
-# Build and start (MCP server only by default, full stack if LLM is configured)
-if [[ -n "$LLM_API_KEY" ]]; then
-    $DC --env-file .env up -d --build 2>&1 | tail -5
-else
-    $DC --env-file .env --profile mcp-only up -d --build 2>&1 | tail -5
-fi
+# Build and start (full stack with profile=full)
+$DC --env-file .env --profile full up -d --build 2>&1 | tail -5
 
 # --- Health check ---
 echo ""

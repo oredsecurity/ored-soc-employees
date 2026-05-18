@@ -19,7 +19,7 @@ RUN groupadd --gid 10001 hermes && \
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      git curl ca-certificates && \
+      git curl ca-certificates xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch "${HERMES_REF}" \

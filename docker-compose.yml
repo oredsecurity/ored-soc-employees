@@ -67,6 +67,8 @@ services:
 
   hermes-agent:
     <<: *security-defaults
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
     build:
       context: ./hermes
       dockerfile: Dockerfile

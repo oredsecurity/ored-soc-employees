@@ -13,7 +13,7 @@ export XDG_STATE_HOME="${XDG_STATE_HOME:-$HERMES_HOME/state}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-$HERMES_HOME/share}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HERMES_HOME/config-home}"
 
-mkdir -p "$HERMES_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$HERMES_HOME/logs" "$HERMES_HOME/sessions" "$HERMES_HOME/cron"
+mkdir -p "$HERMES_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$HERMES_HOME/local" "$HERMES_HOME/logs" "$HERMES_HOME/sessions" "$HERMES_HOME/cron"
 
 strip_quotes() {
     printf '%s' "$1" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"

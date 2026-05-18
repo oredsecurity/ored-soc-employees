@@ -36,7 +36,9 @@ RUN mkdir -p /opt/ored/config \
       /home/hermes/.hermes/cache \
       /home/hermes/.hermes/state \
       /home/hermes/.hermes/share \
-      /home/hermes/.hermes/config-home
+      /home/hermes/.hermes/config-home \
+      /home/hermes/.hermes/local && \
+    ln -s /home/hermes/.hermes/local /home/hermes/.local
 COPY --chown=hermes:hermes config/config.yaml /opt/ored/config/config.yaml
 COPY --chown=hermes:hermes config/SOUL.md /home/hermes/.hermes/SOUL.md
 COPY --chown=hermes:hermes skills/ /home/hermes/.hermes/skills/ored-soc/

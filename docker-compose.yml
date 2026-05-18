@@ -82,6 +82,9 @@ services:
       - HOME=/home/hermes
       - HERMES_HOME=/home/hermes/.hermes
       - XDG_CACHE_HOME=/home/hermes/.hermes/cache
+      - XDG_STATE_HOME=/home/hermes/.hermes/state
+      - XDG_DATA_HOME=/home/hermes/.hermes/share
+      - XDG_CONFIG_HOME=/home/hermes/.hermes/config-home
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_MODEL=${LLM_MODEL:-}

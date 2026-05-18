@@ -1,26 +1,22 @@
 #!/bin/sh
 set -e
 
-# ─────────────────────────────────────────────────────────────────────
-# ORED SOC Employee — Container Entrypoint
-# Bridges generic .env vars (LLM_API_KEY) to Hermes-specific config
-# (~/.hermes/.env and ~/.hermes/config.yaml)
-# ─────────────────────────────────────────────────────────────────────
+# ORED SOC Employee container entrypoint.
+# Writes runtime secrets to HERMES_HOME/.env and renders config.yaml from the
+# read-only template mounted at /opt/ored/config/config.yaml.
 
-mkdir -p /root/.hermes
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+CONFIG_TEMPLATE="${HERMES_CONFIG_TEMPLATE:-/opt/ored/config/config.yaml}"
 
-# Helper: strip surrounding quotes from a value
+mkdir -p "$HERMES_HOME" "$HERMES_HOME/cache" "$HERMES_HOME/logs" "$HERMES_HOME/sessions" "$HERMES_HOME/cron"
+
 strip_quotes() {
-    local val="$1"
-    val="${val#\"}" ; val="${val%\"}"
-    val="${val#\'}" ; val="${val%\'}"
-    echo "$val"
+    printf '%s' "$1" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
 }
 
-# ── 1. Build ~/.hermes/.env ──────────────────────────────────────────
-> /root/.hermes/.env
+: > "$HERMES_HOME/.env"
+chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
 
-# Strip quotes from all credential values (users often quote .env values)
 LLM_API_KEY=$(strip_quotes "${LLM_API_KEY:-}")
 LLM_BASE_URL=$(strip_quotes "${LLM_BASE_URL:-}")
 LLM_MODEL=$(strip_quotes "${LLM_MODEL:-}")
@@ -29,63 +25,44 @@ TELEGRAM_BOT_TOKEN=$(strip_quotes "${TELEGRAM_BOT_TOKEN:-}")
 TELEGRAM_CHAT_ID=$(strip_quotes "${TELEGRAM_CHAT_ID:-}")
 TELEGRAM_ALLOWED_USERS=$(strip_quotes "${TELEGRAM_ALLOWED_USERS:-}")
 
+PROVIDER="${LLM_PROVIDER:-}"
 if [ -n "${LLM_API_KEY:-}" ]; then
-    PROVIDER="${LLM_PROVIDER:-}"
-
-    # Fallback: auto-detect from model name if provider not set
     if [ -z "$PROVIDER" ]; then
         case "${LLM_MODEL:-}" in
-            MiniMax*|minimax*)   PROVIDER="minimax" ;;
-            claude*|Claude*)     PROVIDER="anthropic" ;;
+            MiniMax*|minimax*) PROVIDER="minimax" ;;
+            claude*|Claude*) PROVIDER="anthropic" ;;
             deepseek*|DeepSeek*) PROVIDER="deepseek" ;;
             gpt-*|o1-*|o3-*|o4-*) PROVIDER="openai" ;;
-            *)                   PROVIDER="openai" ;;
+            *) PROVIDER="openai" ;;
         esac
         echo "[entrypoint] LLM_PROVIDER not set, auto-detected: ${PROVIDER}"
     fi
 
-    # Map generic LLM_API_KEY to the provider-specific env var Hermes expects
     case "$PROVIDER" in
-        anthropic)
-            echo "ANTHROPIC_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
-            ;;
-        minimax)
-            echo "MINIMAX_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
-            ;;
-        minimax-cn)
-            echo "MINIMAX_CN_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
-            ;;
-        deepseek)
-            echo "DEEPSEEK_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
-            ;;
-        openrouter)
-            echo "OPENROUTER_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
-            ;;
-        *)
-            # openai or any OpenAI-compatible provider
-            echo "OPENAI_API_KEY=${LLM_API_KEY}" >> /root/.hermes/.env
-            ;;
+        anthropic) echo "ANTHROPIC_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
+        minimax) echo "MINIMAX_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
+        minimax-cn) echo "MINIMAX_CN_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
+        deepseek) echo "DEEPSEEK_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
+        openrouter) echo "OPENROUTER_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
+        *) echo "OPENAI_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
     esac
 fi
 
-# Base URL (for custom endpoints)
-if [ -n "${LLM_BASE_URL:-}" ]; then
-    echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> /root/.hermes/.env
-fi
+[ -n "${LLM_BASE_URL:-}" ] && echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env"
+[ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> "$HERMES_HOME/.env"
+[ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> "$HERMES_HOME/.env"
+[ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}" >> "$HERMES_HOME/.env"
 
-# Telegram
-[ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> /root/.hermes/.env
-[ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> /root/.hermes/.env
-[ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}" >> /root/.hermes/.env
+echo "[entrypoint] HERMES_HOME=${HERMES_HOME}"
+echo "[entrypoint] ${HERMES_HOME}/.env keys:"
+grep -o '^[^=]*' "$HERMES_HOME/.env" || true
 
-echo "[entrypoint] ~/.hermes/.env keys:"
-grep -oP '^[^=]+' /root/.hermes/.env || true
-
-# ── 2. Patch config.yaml with model and provider ────────────────────
-if [ -f /root/.hermes/config.yaml ]; then
-    cp /root/.hermes/config.yaml /tmp/hermes-config.yaml
+if [ -f "$CONFIG_TEMPLATE" ]; then
+    cp "$CONFIG_TEMPLATE" /tmp/hermes-config.yaml
+elif [ -f "$HERMES_HOME/config.yaml" ]; then
+    cp "$HERMES_HOME/config.yaml" /tmp/hermes-config.yaml
 else
-    echo "" > /tmp/hermes-config.yaml
+    : > /tmp/hermes-config.yaml
 fi
 
 if [ -n "${LLM_MODEL:-}" ]; then
@@ -104,10 +81,10 @@ if [ -n "${PROVIDER:-}" ] && [ "$PROVIDER" != "openai" ]; then
     fi
 fi
 
-cp -f /tmp/hermes-config.yaml /root/.hermes/config.yaml 2>/dev/null || true
+cp -f /tmp/hermes-config.yaml "$HERMES_HOME/config.yaml"
+chmod 600 "$HERMES_HOME/config.yaml" 2>/dev/null || true
 
 echo "[entrypoint] config.yaml:"
-cat /root/.hermes/config.yaml
+cat "$HERMES_HOME/config.yaml"
 
-# ── 3. Hand off to CMD ──────────────────────────────────────────────
 exec "$@"

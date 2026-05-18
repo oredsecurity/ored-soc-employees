@@ -5,8 +5,8 @@ Logs every MCP tool call back into Wazuh as a custom audit event.
 This closes the loop: Wazuh generates alerts → agent processes them →
 actions are logged back into Wazuh → full audit trail.
 
-Events are sent to Wazuh via the Wazuh API's custom log injection endpoint,
-creating events with a dedicated decoder/rule set for ORED SOC actions.
+Events are written to a local syslog-style audit file that a Wazuh agent
+collects with a dedicated decoder/rule set for ORED SOC actions.
 
 Part of the ORED AI SOC Employees platform.
 Copyright (c) 2026 ORED Labs. MIT License.
@@ -27,8 +27,8 @@ class WazuhAuditSender:
     """
     Sends audit events back to Wazuh for full-circle logging.
 
-    Uses Wazuh's API to inject custom events that appear in the
-    Wazuh dashboard alongside regular alerts. Each event includes:
+    Writes local audit events that appear in the Wazuh dashboard alongside
+    regular alerts when the host Wazuh agent monitors the audit file:
     - Tool name and classification
     - Sanitized parameters
     - Decision (auto/approved/denied/blocked)
@@ -45,15 +45,15 @@ class WazuhAuditSender:
         self.wazuh_user = os.getenv("WAZUH_USER", "")
         self.wazuh_pass = os.getenv("WAZUH_PASS", "")
         self.verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "false").lower() == "true"
-        self.enabled = bool(self.wazuh_host and self.wazuh_user and self.wazuh_pass)
+        self.enabled = os.getenv("ORED_AUDIT_ENABLED", "true").lower() not in {"0", "false", "no"}
 
         self._token: Optional[str] = None
         self._token_expiry: float = 0
 
         if self.enabled:
-            logger.info("Wazuh audit sender initialized")
+            logger.info("Wazuh audit sender initialized in localfile mode")
         else:
-            logger.warning("Wazuh audit sender DISABLED — missing WAZUH_HOST/USER/PASS")
+            logger.warning("Wazuh audit sender DISABLED via ORED_AUDIT_ENABLED")
 
     @property
     def api_base(self) -> str:
@@ -98,9 +98,8 @@ class WazuhAuditSender:
         """
         Send an audit event to Wazuh.
 
-        Uses the Wazuh manager's log ingestion via /manager/logs.
         The event is formatted as a syslog message with structured JSON payload
-        that can be parsed by a custom Wazuh decoder.
+        and written locally for Wazuh localfile ingestion.
 
         Returns True if successfully sent, False otherwise.
         """
@@ -142,40 +141,10 @@ class WazuhAuditSender:
         )
 
         try:
-            token = await self._authenticate()
-
-            async with httpx.AsyncClient(verify=self.verify_ssl, timeout=15) as client:
-                # Send event via Wazuh API - using active response log channel
-                # This creates an event that Wazuh processes through its pipeline
-                response = await client.post(
-                    f"{self.api_base}/active-response",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={
-                        "command": "ored-soc-audit",
-                        "custom": True,
-                        "alert": {
-                            "data": event_data,
-                            "rule": {
-                                "description": f"ORED SOC: {tool_name} - {status}",
-                                "level": self._event_level(action_class, status),
-                            },
-                        },
-                    },
-                )
-
-                # If active-response endpoint isn't suitable, fall back to
-                # logging the event via the agent's own syslog
-                if response.status_code >= 400:
-                    # Alternative: write to a local log file that Wazuh monitors
-                    await self._write_local_audit_log(syslog_message)
-                    return True
-
-                return True
-
-        except Exception as e:
-            logger.error(f"Failed to send audit event to Wazuh: {e}")
-            # Always write locally as fallback
             await self._write_local_audit_log(syslog_message)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write local audit event: {e}")
             return False
 
     async def _write_local_audit_log(self, message: str) -> None:

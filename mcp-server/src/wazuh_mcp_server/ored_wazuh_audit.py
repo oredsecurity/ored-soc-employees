@@ -183,7 +183,7 @@ class WazuhAuditSender:
 
 
 # Wazuh decoder configuration for ORED SOC audit events
-WAZUH_DECODER_CONFIG = """
+WAZUH_DECODER_CONFIG = r"""
 <!-- ORED SOC Audit Decoder -->
 <!-- Place in /var/ossec/etc/decoders/ored_soc_decoder.xml -->
 

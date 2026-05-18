@@ -25,7 +25,8 @@ RUN apt-get update && \
 RUN git clone --depth 1 --branch "${HERMES_REF}" \
       https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    pip install --no-cache-dir -e ".[messaging,cron,mcp]"
+    pip install --no-cache-dir -e ".[messaging,cron,mcp]" \
+      "anthropic>=0.39.0"
 
 WORKDIR /home/hermes
 

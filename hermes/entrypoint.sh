@@ -44,16 +44,20 @@ if [ -n "${LLM_API_KEY:-}" ]; then
     fi
 
     case "$PROVIDER" in
-        anthropic) echo "ANTHROPIC_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
-        minimax) echo "MINIMAX_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
-        minimax-cn) echo "MINIMAX_CN_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
-        deepseek) echo "DEEPSEEK_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
-        openrouter) echo "OPENROUTER_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
-        *) echo "OPENAI_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env" ;;
+        anthropic) echo "ANTHROPIC_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export ANTHROPIC_API_KEY="$LLM_API_KEY" ;;
+        minimax) echo "MINIMAX_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export MINIMAX_API_KEY="$LLM_API_KEY" ;;
+        minimax-cn) echo "MINIMAX_CN_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export MINIMAX_CN_API_KEY="$LLM_API_KEY" ;;
+        deepseek) echo "DEEPSEEK_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export DEEPSEEK_API_KEY="$LLM_API_KEY" ;;
+        openrouter) echo "OPENROUTER_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export OPENROUTER_API_KEY="$LLM_API_KEY" ;;
+        *) echo "OPENAI_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export OPENAI_API_KEY="$LLM_API_KEY" ;;
     esac
 fi
 
-[ -n "${LLM_BASE_URL:-}" ] && echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env"
+if [ -n "${PROVIDER:-}" ]; then
+    export HERMES_INFERENCE_PROVIDER="$PROVIDER"
+fi
+
+[ -n "${LLM_BASE_URL:-}" ] && echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env" && export OPENAI_BASE_URL="$LLM_BASE_URL"
 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> "$HERMES_HOME/.env"
 [ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> "$HERMES_HOME/.env"
 [ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}" >> "$HERMES_HOME/.env"
@@ -70,23 +74,37 @@ else
     : > /tmp/hermes-config.yaml
 fi
 
-if [ -n "${LLM_MODEL:-}" ]; then
-    if grep -q '^model:' /tmp/hermes-config.yaml 2>/dev/null; then
-        sed -i "s|^model:.*|model: \"${LLM_MODEL}\"|" /tmp/hermes-config.yaml
-    else
-        sed -i "1i model: \"${LLM_MODEL}\"" /tmp/hermes-config.yaml
-    fi
-fi
+python - "$LLM_MODEL" "$PROVIDER" "$LLM_BASE_URL" /tmp/hermes-config.yaml /tmp/hermes-config.rendered.yaml <<'PY'
+import sys
+import yaml
 
-if [ -n "${PROVIDER:-}" ] && [ "$PROVIDER" != "openai" ]; then
-    if grep -q '^provider:' /tmp/hermes-config.yaml 2>/dev/null; then
-        sed -i "s|^provider:.*|provider: \"${PROVIDER}\"|" /tmp/hermes-config.yaml
-    else
-        sed -i "1i provider: \"${PROVIDER}\"" /tmp/hermes-config.yaml
-    fi
-fi
+model, provider, base_url, source, target = sys.argv[1:]
 
-cp -f /tmp/hermes-config.yaml "$HERMES_HOME/config.yaml"
+with open(source, "r", encoding="utf-8") as fh:
+    loaded = yaml.safe_load(fh) or {}
+
+config = loaded if isinstance(loaded, dict) else {}
+model_config = config.get("model")
+if not isinstance(model_config, dict):
+    model_config = {}
+
+if model:
+    model_config["default"] = model
+if provider:
+    model_config["provider"] = provider
+if base_url:
+    model_config["base_url"] = base_url
+
+if model_config:
+    config["model"] = model_config
+
+config.pop("provider", None)
+
+with open(target, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(config, fh, sort_keys=False)
+PY
+
+cp -f /tmp/hermes-config.rendered.yaml "$HERMES_HOME/config.yaml"
 chmod 600 "$HERMES_HOME/config.yaml" 2>/dev/null || true
 
 echo "[entrypoint] config.yaml:"

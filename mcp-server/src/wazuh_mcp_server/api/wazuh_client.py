@@ -76,7 +76,7 @@ class WazuhClient:
                 port=config.wazuh_indexer_port,
                 username=config.wazuh_indexer_user,
                 password=config.wazuh_indexer_pass,
-                verify_ssl=config.verify_ssl,
+                verify_ssl=config.wazuh_indexer_verify_ssl,
                 timeout=config.request_timeout_seconds,
             )
             logger.info(f"WazuhIndexerClient configured for {config.wazuh_indexer_host}:{config.wazuh_indexer_port}")

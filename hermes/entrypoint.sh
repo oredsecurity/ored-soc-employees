@@ -49,6 +49,8 @@ if [ -n "${LLM_API_KEY:-}" ]; then
         minimax-cn) echo "MINIMAX_CN_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export MINIMAX_CN_API_KEY="$LLM_API_KEY" ;;
         deepseek) echo "DEEPSEEK_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export DEEPSEEK_API_KEY="$LLM_API_KEY" ;;
         openrouter) echo "OPENROUTER_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export OPENROUTER_API_KEY="$LLM_API_KEY" ;;
+        opencode-go|opencode_go|go) echo "OPENCODE_GO_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export OPENCODE_GO_API_KEY="$LLM_API_KEY" ;;
+        opencode-zen|opencode_zen|opencode|zen) echo "OPENCODE_ZEN_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export OPENCODE_ZEN_API_KEY="$LLM_API_KEY" ;;
         *) echo "OPENAI_API_KEY=${LLM_API_KEY}" >> "$HERMES_HOME/.env"; export OPENAI_API_KEY="$LLM_API_KEY" ;;
     esac
 fi
@@ -57,7 +59,13 @@ if [ -n "${PROVIDER:-}" ]; then
     export HERMES_INFERENCE_PROVIDER="$PROVIDER"
 fi
 
-[ -n "${LLM_BASE_URL:-}" ] && echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env" && export OPENAI_BASE_URL="$LLM_BASE_URL"
+if [ -n "${LLM_BASE_URL:-}" ]; then
+    case "$PROVIDER" in
+        opencode-go|opencode_go|go) echo "OPENCODE_GO_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env"; export OPENCODE_GO_BASE_URL="$LLM_BASE_URL" ;;
+        opencode-zen|opencode_zen|opencode|zen) echo "OPENCODE_ZEN_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env"; export OPENCODE_ZEN_BASE_URL="$LLM_BASE_URL" ;;
+        *) echo "OPENAI_BASE_URL=${LLM_BASE_URL}" >> "$HERMES_HOME/.env"; export OPENAI_BASE_URL="$LLM_BASE_URL" ;;
+    esac
+fi
 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> "$HERMES_HOME/.env"
 [ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "TELEGRAM_HOME_CHANNEL=${TELEGRAM_CHAT_ID}" >> "$HERMES_HOME/.env"
 [ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}" >> "$HERMES_HOME/.env"

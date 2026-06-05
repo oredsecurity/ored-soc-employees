@@ -74,6 +74,7 @@ class WazuhConfig:
     wazuh_indexer_port: int = 9200
     wazuh_indexer_user: Optional[str] = None
     wazuh_indexer_pass: Optional[str] = None
+    wazuh_indexer_verify_ssl: bool = True
 
     # Transport settings
     mcp_transport: str = "http"  # Default to HTTP/SSE mode
@@ -140,6 +141,7 @@ class WazuhConfig:
             wazuh_indexer_port=safe_int_env("WAZUH_INDEXER_PORT", "9200", min_val=1, max_val=65535),
             wazuh_indexer_user=os.getenv("WAZUH_INDEXER_USER"),
             wazuh_indexer_pass=os.getenv("WAZUH_INDEXER_PASS"),
+            wazuh_indexer_verify_ssl=os.getenv("WAZUH_INDEXER_VERIFY_SSL", "true").lower() == "true",
             mcp_transport=os.getenv("MCP_TRANSPORT", "http"),  # Default to HTTP/SSE
             mcp_host=os.getenv("MCP_HOST", "0.0.0.0"),
             mcp_port=safe_int_env("MCP_PORT", "3000", min_val=1, max_val=65535),

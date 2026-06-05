@@ -6,6 +6,7 @@ Production-ready with Streamable HTTP and legacy SSE transport, authentication, 
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -55,6 +56,7 @@ from wazuh_mcp_server.security import (
 )
 from wazuh_mcp_server.session_store import SessionStore, create_session_store
 from wazuh_mcp_server.ored_audit import OREDAuditMiddleware
+from wazuh_mcp_server.ored_poller import WazuhAlertPoller
 
 # MCP Protocol Version Support
 # Latest: 2025-11-25, also supports backwards compatibility with older versions
@@ -363,17 +365,107 @@ async def get_or_create_session(session_id: Optional[str], origin: Optional[str]
     return session
 
 
+alert_poller: Optional[WazuhAlertPoller] = None
+
+
+def _format_poller_notification(alerts: List[Dict[str, Any]]) -> str:
+    """Format newly observed alerts for a compact Telegram notification."""
+    shown = alerts[:5]
+    lines = [
+        f"<b>ARGOS poller</b>: {len(alerts)} new security item(s) observed.",
+        "No response action was taken automatically.",
+    ]
+
+    for index, alert in enumerate(shown, start=1):
+        alert_type = html.escape(str(alert.get("type") or "alert"))
+        timestamp = html.escape(str(alert.get("timestamp") or "unknown time"))
+
+        agent = alert.get("agent") or {}
+        agent_id = html.escape(str(agent.get("id") or "unknown"))
+        agent_name = html.escape(str(agent.get("name") or "unknown"))
+
+        rule = alert.get("rule") or {}
+        rule_id = html.escape(str(rule.get("id") or "n/a"))
+        rule_level = html.escape(str(rule.get("level") or "n/a"))
+        description = html.escape(str(rule.get("description") or alert_type))
+
+        policy = alert.get("policy") or {}
+        if policy:
+            description = html.escape(str(policy.get("name") or policy.get("policy_id") or description))
+
+        lines.extend(
+            [
+                "",
+                f"<b>{index}.</b> {description}",
+                f"Agent: <code>{agent_id}</code> {agent_name}",
+                f"Rule: <code>{rule_id}</code> level <code>{rule_level}</code>",
+                f"Type: <code>{alert_type}</code>",
+                f"Time: <code>{timestamp}</code>",
+            ]
+        )
+
+    if len(alerts) > len(shown):
+        lines.append(f"\n...and {len(alerts) - len(shown)} more item(s).")
+
+    message = "\n".join(lines)
+    return message[:3900]
+
+
+async def handle_poller_alerts(alerts: List[Dict[str, Any]]) -> None:
+    """Handle autonomous poller observations without taking response action."""
+    if not alerts:
+        return
+
+    logger.info("ARGOS poller observed %d new security item(s)", len(alerts))
+
+    try:
+        from wazuh_mcp_server.ored_approval import approval_bot
+
+        if approval_bot.enabled:
+            await approval_bot.send_notification(_format_poller_notification(alerts))
+    except Exception as exc:
+        logger.warning("Poller notification callback failed: %s", exc)
+
+
+def get_poller_status() -> Dict[str, Any]:
+    """Return poller status even before startup has initialized it."""
+    if alert_poller is None:
+        return {
+            "enabled": False,
+            "running": False,
+            "configured": False,
+            "last_error": "not_initialized",
+            "consecutive_errors": 0,
+        }
+    return alert_poller.status()
+
+
+def get_poller_service_status(poller_status: Dict[str, Any]) -> str:
+    """Map detailed poller state to a health service label."""
+    if not poller_status.get("enabled"):
+        return "disabled"
+    if not poller_status.get("configured"):
+        return "not_configured"
+    if not poller_status.get("running"):
+        return "stopped"
+    if poller_status.get("consecutive_errors", 0) > 0:
+        return "degraded"
+    return "healthy"
+
+
 # Lifespan context manager for startup/shutdown events (modern FastAPI pattern)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle with proper startup and shutdown handling."""
-    global _oauth_manager
+    global _oauth_manager, alert_poller
 
     # === STARTUP ===
     # Attach log sanitization filter to prevent credential leakage
     from wazuh_mcp_server.security import SanitizingLogFilter
 
     logging.getLogger().addFilter(SanitizingLogFilter())
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     logger.info(f"Wazuh MCP Server v{__version__} starting up...")
     logger.info(f"📡 MCP Protocol: {MCP_PROTOCOL_VERSION}")
@@ -437,6 +529,14 @@ async def lifespan(app: FastAPI):
 
     _cleanup_task = asyncio.create_task(_background_session_cleanup())
 
+    # Start autonomous ORED alert polling. The callback only notifies/logs;
+    # response actions still require explicit tool calls and approval policy.
+    try:
+        alert_poller = WazuhAlertPoller(on_new_alerts=handle_poller_alerts)
+        alert_poller.start()
+    except Exception as e:
+        logger.error(f"ORED poller startup failed: {e}")
+
     # Initialize Wazuh client (will be available after yield)
     logger.info("✅ Server startup complete with high availability features enabled")
 
@@ -451,6 +551,10 @@ async def lifespan(app: FastAPI):
         await _cleanup_task
     except asyncio.CancelledError:
         pass
+
+    # Stop autonomous ORED alert polling before closing Wazuh connections.
+    if alert_poller is not None:
+        await alert_poller.stop()
 
     try:
         # Initiate graceful shutdown (waits for active connections)
@@ -522,6 +626,7 @@ wazuh_config = WazuhConfig(
     wazuh_indexer_port=config.WAZUH_INDEXER_PORT,
     wazuh_indexer_user=config.WAZUH_INDEXER_USER if config.WAZUH_INDEXER_USER else None,
     wazuh_indexer_pass=config.WAZUH_INDEXER_PASS if config.WAZUH_INDEXER_PASS else None,
+    wazuh_indexer_verify_ssl=config.WAZUH_INDEXER_VERIFY_SSL,
 )
 
 # Initialize Wazuh client
@@ -2980,10 +3085,15 @@ async def health_check():
             auth_info["oauth_endpoints"] = ["/oauth/authorize", "/oauth/token", "/oauth/register"]
             auth_info["oauth_discovery"] = "/.well-known/oauth-authorization-server"
 
+        poller_status = get_poller_status()
+        poller_service_status = get_poller_service_status(poller_status)
+
         # Determine overall status from component health
         if wazuh_status != "healthy":
             overall_status = "degraded"
         elif isinstance(indexer_status, str) and indexer_status.startswith("unhealthy"):
+            overall_status = "degraded"
+        elif poller_service_status in {"degraded", "stopped"}:
             overall_status = "degraded"
         else:
             overall_status = "healthy"
@@ -3001,7 +3111,13 @@ async def health_check():
                     "legacy_sse": "enabled",
                 },
                 "authentication": auth_info,
-                "services": {"wazuh_manager": wazuh_status, "wazuh_indexer": indexer_status, "mcp": "healthy"},
+                "services": {
+                    "wazuh_manager": wazuh_status,
+                    "wazuh_indexer": indexer_status,
+                    "mcp": "healthy",
+                    "ored_poller": poller_service_status,
+                },
+                "poller": poller_status,
                 "vulnerability_tools": {
                     "available": wazuh_client._indexer_client is not None,
                     "note": (

@@ -21,12 +21,50 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger("ored.poller")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean environment variable with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    logger.warning("Invalid %s value %r; using default %s", name, raw, default)
+    return default
+
+
+def _env_int(name: str, default: int, min_value: int = 1, max_value: Optional[int] = None) -> int:
+    """Parse an integer environment variable with range checks and fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s value %r; using default %s", name, raw, default)
+        return default
+
+    if value < min_value:
+        logger.warning("Invalid %s value %r; using minimum %s", name, raw, min_value)
+        return min_value
+    if max_value is not None and value > max_value:
+        logger.warning("Invalid %s value %r; using maximum %s", name, raw, max_value)
+        return max_value
+    return value
 
 
 @dataclass
@@ -41,10 +79,10 @@ class PollerConfig:
     @classmethod
     def from_env(cls) -> "PollerConfig":
         return cls(
-            enabled=os.getenv("ORED_POLL_ENABLED", "true").lower() == "true",
-            interval=int(os.getenv("ORED_POLL_INTERVAL", "60")),
-            min_level=int(os.getenv("ORED_POLL_MIN_LEVEL", "5")),
-            batch_size=int(os.getenv("ORED_POLL_BATCH_SIZE", "100")),
+            enabled=_env_bool("ORED_POLL_ENABLED", True),
+            interval=_env_int("ORED_POLL_INTERVAL", 60, min_value=5, max_value=3600),
+            min_level=_env_int("ORED_POLL_MIN_LEVEL", 5, min_value=0, max_value=20),
+            batch_size=_env_int("ORED_POLL_BATCH_SIZE", 100, min_value=1, max_value=1000),
         )
 
 
@@ -94,7 +132,7 @@ class WazuhAlertPoller:
     def __init__(
         self,
         config: Optional[PollerConfig] = None,
-        on_new_alerts: Optional[callable] = None,
+        on_new_alerts: Optional[Callable[[List[Dict[str, Any]]], Any]] = None,
     ):
         self.config = config or PollerConfig.from_env()
         self.state = PollState()
@@ -109,6 +147,14 @@ class WazuhAlertPoller:
         self.wazuh_pass = os.getenv("WAZUH_PASS", "")
         self.verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "false").lower() == "true"
 
+        # Wazuh Indexer connection. Alerts live in the Indexer on Wazuh 4.8+,
+        # so prefer this path when configured and fall back to Manager API scans.
+        self.indexer_host = os.getenv("WAZUH_INDEXER_HOST", "").rstrip("/")
+        self.indexer_port = os.getenv("WAZUH_INDEXER_PORT", "9200")
+        self.indexer_user = os.getenv("WAZUH_INDEXER_USER", "")
+        self.indexer_pass = os.getenv("WAZUH_INDEXER_PASS", "")
+        self.indexer_verify_ssl = os.getenv("WAZUH_INDEXER_VERIFY_SSL", "true").lower() == "true"
+
         self._token: Optional[str] = None
         self._token_expiry: float = 0
 
@@ -117,6 +163,10 @@ class WazuhAlertPoller:
         host = self.wazuh_host
         if not host.startswith(("http://", "https://")):
             host = f"https://{host}"
+
+        parsed = urlparse(host)
+        if parsed.port:
+            return host
         return f"{host}:{self.wazuh_port}"
 
     async def _authenticate(self) -> str:
@@ -136,8 +186,77 @@ class WazuhAlertPoller:
             self._token_expiry = time.time() + 720
             return self._token
 
+    @property
+    def indexer_base(self) -> str:
+        host = self.indexer_host
+        if not host.startswith(("http://", "https://")):
+            host = f"https://{host}"
+
+        parsed = urlparse(host)
+        if parsed.port:
+            return host
+        return f"{host}:{self.indexer_port}"
+
+    @property
+    def indexer_configured(self) -> bool:
+        return bool(self.indexer_host and self.indexer_user and self.indexer_pass)
+
+    async def _fetch_alerts_from_indexer(self) -> List[Dict[str, Any]]:
+        """Fetch real alert documents from Wazuh Indexer."""
+        if not self.indexer_configured:
+            return []
+
+        since = self.state.last_poll_time
+        if not since:
+            since_dt = datetime.now(timezone.utc) - timedelta(seconds=self.config.interval)
+            since = since_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+        query = {
+            "size": self.config.batch_size,
+            "sort": [{"timestamp": {"order": "desc"}}],
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"range": {"timestamp": {"gt": since}}},
+                        {"range": {"rule.level": {"gte": self.config.min_level}}},
+                    ]
+                }
+            },
+        }
+
+        async with httpx.AsyncClient(verify=self.indexer_verify_ssl, timeout=30) as client:
+            response = await client.post(
+                f"{self.indexer_base}/wazuh-alerts-*/_search",
+                auth=(self.indexer_user, self.indexer_pass),
+                json=query,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        alerts: List[Dict[str, Any]] = []
+        for hit in data.get("hits", {}).get("hits", []):
+            source = hit.get("_source") or {}
+            if not isinstance(source, dict):
+                continue
+            alert = dict(source)
+            alert.setdefault("type", "wazuh_alert")
+            alert.setdefault("id", hit.get("_id") or "")
+            alert["index"] = hit.get("_index")
+            alerts.append(alert)
+
+        logger.debug("Fetched %d real alert(s) from Wazuh Indexer", len(alerts))
+        return alerts
+
     async def _fetch_alerts(self) -> List[Dict[str, Any]]:
-        """Fetch alerts from Wazuh API, filtered by time and severity."""
+        """Fetch alerts, preferring Wazuh Indexer when configured."""
+        if self.indexer_configured:
+            try:
+                alerts = await self._fetch_alerts_from_indexer()
+                logger.debug("Using Wazuh Indexer alert source")
+                return alerts
+            except Exception as e:
+                logger.warning("Indexer alert query failed; falling back to Wazuh Manager API: %s", e)
+
         token = await self._authenticate()
 
         params = {
@@ -227,6 +346,41 @@ class WazuhAlertPoller:
                     except Exception as e:
                         logger.debug(f"SCA check failed for agent {agent_id}: {e}")
 
+                    # Check safe scan timestamps so the fallback path can
+                    # observe controlled demo scans when /alerts is unavailable.
+                    for scan_type, endpoint in (
+                        ("syscheck_scan", f"{self.api_base}/syscheck/{agent_id}/last_scan"),
+                        ("rootcheck_scan", f"{self.api_base}/rootcheck/{agent_id}/last_scan"),
+                    ):
+                        try:
+                            scan_response = await client.get(endpoint, headers=headers)
+                            if scan_response.status_code != 200:
+                                continue
+
+                            scan_data = scan_response.json()
+                            for scan in scan_data.get("data", {}).get("affected_items", []):
+                                scan_time = scan.get("end") or scan.get("start") or ""
+                                if (
+                                    scan_time
+                                    and (
+                                        not self.state.last_poll_time
+                                        or scan_time > self.state.last_poll_time
+                                    )
+                                ):
+                                    alerts.append(
+                                        {
+                                            "type": scan_type,
+                                            "agent": agent,
+                                            "scan": scan,
+                                            "timestamp": scan_time,
+                                            "id": f"{scan_type}-{agent_id}-{scan_time}",
+                                        }
+                                    )
+                        except Exception as e:
+                            logger.debug(
+                                f"{scan_type} timestamp check failed for agent {agent_id}: {e}"
+                            )
+
             except Exception as e:
                 logger.warning(f"Agent enumeration failed: {e}")
 
@@ -259,9 +413,11 @@ class WazuhAlertPoller:
                 except ValueError:
                     rule_level = 0
 
-            # SCA scan results always pass through (they have no rule level)
+            # Fallback scan observations have no rule level, but they are
+            # intentional security items produced by safe Wazuh scans.
             alert_type = alert.get("type", "")
-            if alert_type != "sca_scan" and rule_level < self.config.min_level:
+            scan_observation_types = {"sca_scan", "syscheck_scan", "rootcheck_scan"}
+            if alert_type not in scan_observation_types and rule_level < self.config.min_level:
                 self.state.total_alerts_skipped += 1
                 continue
 
@@ -385,6 +541,9 @@ class WazuhAlertPoller:
         return {
             "enabled": self.config.enabled,
             "running": self._running,
+            "configured": bool((self.wazuh_host and self.wazuh_user) or self.indexer_configured),
+            "source": "wazuh_indexer" if self.indexer_configured else "wazuh_manager_api",
+            "task_done": self._task.done() if self._task else None,
             "interval": self.config.interval,
             "min_level": self.config.min_level,
             "total_polls": self.state.total_polls,

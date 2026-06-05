@@ -490,6 +490,7 @@ SENSITIVE_PATTERNS = [
     (r'(secret["\']?\s*[:=]\s*["\']?)[^"\'\s,}]+', r"\1[REDACTED]"),
     (r'(authorization["\']?\s*[:=]\s*["\']?)[^"\'\s,}]+', r"\1[REDACTED]"),
     (r"(bearer\s+)[a-zA-Z0-9._-]+", r"\1[REDACTED]"),
+    (r"(api\.telegram\.org/bot)[^/\s\"]+", r"\1[REDACTED]"),
     (r"wst_[a-zA-Z0-9_-]+", "wst_[REDACTED]"),
     (r"wazuh_[a-zA-Z0-9_-]{40,}", "wazuh_[REDACTED]"),
 ]

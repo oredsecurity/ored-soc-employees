@@ -43,6 +43,9 @@ services:
       - AUTH_MODE=${MCP_AUTH_MODE:-none}
       - AUTH_SECRET_KEY=${MCP_AUTH_SECRET_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
       - ORED_POLL_ENABLED=${ORED_POLL_ENABLED:-true}
       - ORED_POLL_INTERVAL=${ORED_POLL_INTERVAL:-60}
       - ORED_POLL_MIN_LEVEL=${ORED_POLL_MIN_LEVEL:-5}
@@ -51,6 +54,9 @@ services:
       - WAZUH_INDEXER_PORT=${WAZUH_INDEXER_PORT:-9200}
       - WAZUH_INDEXER_USER=${WAZUH_INDEXER_USER:-}
       - WAZUH_INDEXER_PASS=${WAZUH_INDEXER_PASS:-}
+      - WAZUH_INDEXER_VERIFY_SSL=${WAZUH_INDEXER_VERIFY_SSL:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - mcp-audit:/var/log/ored-soc
     networks:

@@ -39,7 +39,7 @@ async def test_block_ip_refuses_disconnected_agent():
 
 
 @pytest.mark.asyncio
-async def test_block_ip_refuses_windows_until_netsh_rollback_exists():
+async def test_block_ip_refuses_windows_until_custom_dispatch_is_validated():
     client = FakeWazuhClient(agent("windows"))
 
     with pytest.raises(ValueError, match="OS 'windows' is not supported"):
@@ -78,7 +78,7 @@ async def test_generic_active_response_normalizes_command_name():
 
 
 @pytest.mark.asyncio
-async def test_generic_active_response_blocks_netsh_until_rollback_exists():
+async def test_generic_active_response_blocks_builtin_netsh():
     client = FakeWazuhClient(agent("windows"))
 
     with pytest.raises(ValueError, match="Unknown active response command"):

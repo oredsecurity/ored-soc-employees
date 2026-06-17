@@ -1,0 +1,88 @@
+# Windows Active Response Wrapper
+
+Status: live-tested for explicit add and rollback on `001 / ored-win-01`. ARGOS may use this wrapper for one active Windows agent after human approval. Generic raw Windows `netsh` remains blocked.
+
+## Why This Exists
+
+Wazuh API active-response success means the manager accepted and dispatched a command. It does not prove the endpoint changed firewall state. The built-in Windows `netsh.exe` active-response can create a block, but rollback through the same path was unreliable.
+
+The ORED wrapper is intended to make Windows containment explicit and reversible:
+
+- create only rules named `ORED ARGOS BLOCKED IP`;
+- block one IP at a time;
+- remove only matching ORED-owned rules;
+- verify final firewall state before returning success;
+- log endpoint evidence to `active-responses.log`.
+
+## Current Findings From June 17, 2026
+
+What worked:
+
+- Native MinGW-built Windows executables launch from Wazuh when the command is present in generated `ar.conf`.
+- `ored-win-firewall-v2.exe` successfully created an inbound Windows firewall block for `203.0.113.62` through Wazuh API.
+- Endpoint evidence confirmed the rule existed:
+  - Display name: `ORED ARGOS BLOCKED IP`
+  - Remote address: `203.0.113.62`
+- Wrapper evidence confirmed add success:
+  - `ored-win-firewall: requested action=add srcip=203.0.113.62`
+  - `ored-win-firewall: add srcip=203.0.113.62 rc=0`
+
+What changed after implementing the Wazuh protocol:
+
+- The wrapper now emits `check_keys` and waits for Wazuh's `continue` response before acting.
+- The wrapper uses different keys for add and rollback: `ored-win-firewall:add:<ip>` and `ored-win-firewall:delete:<ip>`.
+- `!ored-win-firewall-v3` successfully added `203.0.113.80`.
+- `!ored-win-firewall-rollback` successfully removed `203.0.113.80`.
+- Endpoint logs showed both `add ... rc=0` and `delete ... rc=0`.
+
+## Safe Live State After Test
+
+The live manager-generated `ar.conf` now includes the tested wrapper commands:
+
+```text
+ored-win-firewall-v30 - ored-win-firewall-v3.exe - 0
+ored-win-firewall-rollback0 - ored-win-firewall-rollback.exe - 0
+```
+
+The Windows endpoint was cleaned:
+
+- no `ORED ARGOS BLOCKED IP` rules remained;
+- the old pre-existing `WAZUH ACTIVE RESPONSE BLOCKED IP` rule for `72.49.230.60` was left untouched;
+- original Wazuh `netsh.exe` was restored.
+
+## Files
+
+Source and installer artifacts live in:
+
+```text
+scripts/active-response/windows/ored-win-firewall-native.c
+scripts/active-response/windows/install-ored-win-firewall-native.cmd
+```
+
+Build command:
+
+```bash
+x86_64-w64-mingw32-gcc -O2 -static -Wall -Wextra -o scripts/active-response/windows/ored-win-firewall.exe scripts/active-response/windows/ored-win-firewall-native.c
+```
+
+## Next Engineering Direction
+
+Windows containment can be enabled through the high-level guarded ARGOS tools only:
+
+1. `wazuh_firewall_drop` / `wazuh_block_ip` maps Windows targets to `!ored-win-firewall-v3`.
+2. `wazuh_firewall_allow` maps Windows targets to `!ored-win-firewall-rollback`.
+3. Generic `wazuh_active_response` must continue to reject raw `netsh` and unlisted Windows commands.
+4. Timed Windows auto-rollback remains unsupported; use explicit `firewall_allow`.
+
+## References
+
+- Wazuh custom active response scripts: https://documentation.wazuh.com/current/user-manual/capabilities/active-response/custom-active-response-scripts.html
+- Wazuh active response configuration: https://documentation.wazuh.com/current/user-manual/capabilities/active-response/how-to-configure.html
+- Wazuh `ossec.conf` active-response reference: https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/active-response.html
+
+
+## Final June 17 Note
+
+A later cleanup pass tested separate `block`/`unblock` command names and then removed all experimental manager registrations. This improved command clarity but did not make rollback reliable enough to trust.
+
+Current product behavior must stay unchanged: Windows firewall containment is blocked in ARGOS. The wrapper files are experimental artifacts only until a future test proves both block and rollback repeatedly through Wazuh API, with endpoint firewall evidence and no hung wrapper processes.

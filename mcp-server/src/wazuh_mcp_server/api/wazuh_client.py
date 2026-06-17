@@ -1092,7 +1092,7 @@ class WazuhClient:
     @staticmethod
     def _command_for_ip_block(platform: str) -> str:
         if platform != "linux":
-            raise ValueError("IP blocking is enabled only for Linux endpoints until Windows netsh rollback is implemented")
+            raise ValueError("IP blocking is enabled only for Linux endpoints until Windows custom dispatch is validated")
         return "!firewall-drop"
 
     async def block_ip(self, ip_address: str, duration: int = 0, agent_id: str = None) -> Dict[str, Any]:

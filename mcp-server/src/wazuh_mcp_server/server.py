@@ -1650,7 +1650,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         # Active Response / Action Tools (9 tools)
         {
             "name": "wazuh_block_ip",
-            "description": "[ACTION] Block an IP address via Wazuh active response. Requires one active Linux agent; Windows is blocked until netsh rollback is implemented. Risk: LOW, Reversible on Linux.",
+            "description": "[ACTION] Block an IP address via Wazuh active response. Requires one active Linux agent; Windows is blocked until custom wrapper rollback is validated. Risk: LOW, Reversible on Linux.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1726,7 +1726,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_firewall_drop",
-            "description": "[ACTION] Add a firewall block on one active Linux agent. Windows is blocked until netsh rollback is implemented. Risk: MEDIUM, Reversible on Linux.",
+            "description": "[ACTION] Add a firewall block on one active Linux agent. Windows is blocked until custom wrapper rollback is validated. Risk: MEDIUM, Reversible on Linux.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1862,7 +1862,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_firewall_allow",
-            "description": "[ACTION] Remove a firewall block on one active Linux agent. Windows is blocked until netsh rollback is implemented. Risk: MEDIUM, Reversal of firewall_drop.",
+            "description": "[ACTION] Remove a firewall block on one active Linux agent. Windows is blocked until custom wrapper rollback is validated. Risk: MEDIUM, Reversal of firewall_drop.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -79,12 +79,12 @@ Only after receiving approval. Active response is OS-aware and fail-closed: alwa
 
 1. **Block IP**: `mcp_wazuh_wazuh_block_ip`
    - Params: ip_address, agent_id
-   - Linux-only in the current deployment. Windows `netsh.exe` dispatch is blocked until reliable rollback is implemented.
+   - Linux-only in the current deployment. Windows built-in `netsh.exe` and ORED wrapper paths remain blocked until rollback is validated.
    - Verify: `mcp_wazuh_wazuh_check_blocked_ip`
 
 2. **Firewall Drop**: `mcp_wazuh_wazuh_firewall_drop`
    - Params: agent_id, source IP
-   - Linux-only in the current deployment. Windows `netsh.exe` dispatch is blocked until reliable rollback is implemented.
+   - Linux-only in the current deployment. Windows built-in `netsh.exe` and ORED wrapper paths remain blocked until rollback is validated.
    - Verify: `mcp_wazuh_wazuh_check_blocked_ip`
 
 3. **Host Deny**: `mcp_wazuh_wazuh_host_deny`
@@ -156,8 +156,8 @@ After containment:
 
 | Action | Policy | Tool |
 |--------|--------|------|
-| Block IP | Approval required, Linux-only until Windows rollback is implemented | `wazuh_block_ip` |
-| Firewall drop | Approval required, Linux-only until Windows rollback is implemented | `wazuh_firewall_drop` |
+| Block IP | Approval required, Linux-only until Windows rollback is validated | `wazuh_block_ip` |
+| Firewall drop | Approval required, Linux-only until Windows rollback is validated | `wazuh_firewall_drop` |
 | Host deny | Approval required, Linux-only | `wazuh_host_deny` |
 | Disable user | Approval required, Linux-only in current deployment | `wazuh_disable_user` |
 | Isolate host | Approval required but not configured yet | `wazuh_isolate_host` |

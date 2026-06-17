@@ -1650,7 +1650,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         # Active Response / Action Tools (9 tools)
         {
             "name": "wazuh_block_ip",
-            "description": "[ACTION] Block an IP address via Wazuh active response firewall-drop. Risk: LOW, Reversible.",
+            "description": "[ACTION] Block an IP address via Wazuh active response. Requires one active Linux agent; Windows is blocked until netsh rollback is implemented. Risk: LOW, Reversible on Linux.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1661,14 +1661,14 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
                         "default": 0,
                         "description": "Block duration in seconds (0 = permanent)",
                     },
-                    "agent_id": {"type": "string", "description": "Target agent ID (empty = all agents)"},
+                    "agent_id": {"type": "string", "description": "Required target agent ID; all-agents targeting is refused"},
                 },
-                "required": ["ip_address"],
+                "required": ["ip_address", "agent_id"],
             },
         },
         {
             "name": "wazuh_isolate_host",
-            "description": "[ACTION] Isolate a host from the network via active response. Risk: MEDIUM, Reversible.",
+            "description": "[ACTION] Host isolation request. Approval required, but blocked until tested host-isolation scripts are configured. Risk: MEDIUM, Reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"agent_id": {"type": "string", "description": "ID of the agent to isolate"}},
@@ -1677,7 +1677,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_kill_process",
-            "description": "[ACTION] Terminate a process on an agent via active response. Risk: MEDIUM, Not reversible.",
+            "description": "[ACTION] Process termination request. Approval required, but blocked until tested kill-process scripts are configured. Risk: MEDIUM, Not reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1689,7 +1689,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_disable_user",
-            "description": "[ACTION] Disable a user account on an agent via active response. Risk: HIGH, Reversible.",
+            "description": "[ACTION] Disable a user account via OS-aware active response. Requires one active Linux agent in the current deployment. Risk: HIGH, Reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1701,7 +1701,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_quarantine_file",
-            "description": "[ACTION] Quarantine a file on an agent via active response. Risk: LOW, Reversible.",
+            "description": "[ACTION] File quarantine request. Approval required, but blocked until tested quarantine scripts are configured. Risk: LOW, Reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1713,7 +1713,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_active_response",
-            "description": "[ACTION] Execute a generic Wazuh active response command. Risk: HIGH, Not reversible.",
+            "description": "[ACTION] Execute a generic OS-aware Wazuh active response command from the allowlist. Requires one active compatible agent; Windows netsh and restart-wazuh are forbidden. Risk: HIGH, Not reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1726,7 +1726,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_firewall_drop",
-            "description": "[ACTION] Add a firewall drop rule on an agent via active response. Risk: MEDIUM, Reversible.",
+            "description": "[ACTION] Add a firewall block on one active Linux agent. Windows is blocked until netsh rollback is implemented. Risk: MEDIUM, Reversible on Linux.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1744,7 +1744,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_host_deny",
-            "description": "[ACTION] Add an entry to hosts.deny on an agent via active response. Risk: MEDIUM, Reversible.",
+            "description": "[ACTION] Add a hosts.deny entry on one active Linux agent. Blocked on Windows. Risk: MEDIUM, Reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1829,7 +1829,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         # Rollback Tools (5 tools)
         {
             "name": "wazuh_unisolate_host",
-            "description": "[ACTION] Remove host network isolation. Risk: MEDIUM, Reversal of isolate_host.",
+            "description": "[ACTION] Host isolation rollback request. Approval required, but blocked until tested host-isolation scripts are configured. Risk: MEDIUM.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"agent_id": {"type": "string", "description": "ID of the agent to unisolate"}},
@@ -1838,7 +1838,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_enable_user",
-            "description": "[ACTION] Re-enable a disabled user account. Risk: HIGH, Reversal of disable_user.",
+            "description": "[ACTION] Re-enable a disabled user account. Requires one active Linux agent in the current deployment. Risk: HIGH, Reversal of disable_user.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1850,7 +1850,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_restore_file",
-            "description": "[ACTION] Restore a quarantined file. Risk: LOW, Reversal of quarantine_file.",
+            "description": "[ACTION] File quarantine rollback request. Approval required, but blocked until tested quarantine scripts are configured. Risk: LOW.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1862,7 +1862,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_firewall_allow",
-            "description": "[ACTION] Remove a firewall drop rule. Risk: MEDIUM, Reversal of firewall_drop.",
+            "description": "[ACTION] Remove a firewall block on one active Linux agent. Windows is blocked until netsh rollback is implemented. Risk: MEDIUM, Reversal of firewall_drop.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1874,7 +1874,7 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
         },
         {
             "name": "wazuh_host_allow",
-            "description": "[ACTION] Remove a hosts.deny entry. Risk: MEDIUM, Reversal of host_deny.",
+            "description": "[ACTION] Remove a hosts.deny entry on one active Linux agent. Blocked on Windows. Risk: MEDIUM, Reversal of host_deny.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

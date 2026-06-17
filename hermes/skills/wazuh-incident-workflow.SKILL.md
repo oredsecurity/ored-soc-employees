@@ -75,31 +75,29 @@ Send via Telegram/Slack approval interface. WAIT for response.
 
 ### Step 4: Execute Approved Actions
 
-Only after receiving approval:
+Only after receiving approval. Active response is OS-aware and fail-closed: always target one specific active `agent_id`. If Wazuh cannot identify the endpoint OS, the agent is disconnected, or the action is not safely reversible for that OS, report that action is blocked. Do not target `all agents`.
 
 1. **Block IP**: `mcp_wazuh_wazuh_block_ip`
-   - Params: ip_address, agent_id (or all agents)
+   - Params: ip_address, agent_id
+   - Linux-only in the current deployment. Windows `netsh.exe` dispatch is blocked until reliable rollback is implemented.
    - Verify: `mcp_wazuh_wazuh_check_blocked_ip`
 
-2. **Isolate Host**: `mcp_wazuh_wazuh_isolate_host`
-   - Params: agent_id
-   - Verify: `mcp_wazuh_wazuh_check_agent_isolation`
+2. **Firewall Drop**: `mcp_wazuh_wazuh_firewall_drop`
+   - Params: agent_id, source IP
+   - Linux-only in the current deployment. Windows `netsh.exe` dispatch is blocked until reliable rollback is implemented.
+   - Verify: `mcp_wazuh_wazuh_check_blocked_ip`
 
-3. **Kill Process**: `mcp_wazuh_wazuh_kill_process`
-   - Params: agent_id, process name/PID
-   - Verify: `mcp_wazuh_wazuh_check_process`
+3. **Host Deny**: `mcp_wazuh_wazuh_host_deny`
+   - Params: agent_id, source IP
+   - Linux-only; blocked on Windows
 
-4. **Quarantine File**: `mcp_wazuh_wazuh_quarantine_file`
-   - Params: agent_id, file path
-   - Verify: `mcp_wazuh_wazuh_check_file_quarantine`
-
-5. **Disable User**: `mcp_wazuh_wazuh_disable_user`
+4. **Disable User**: `mcp_wazuh_wazuh_disable_user`
    - Params: agent_id, username
+   - Linux-only in the current deployment; blocked on Windows
    - Verify: `mcp_wazuh_wazuh_check_user_status`
 
-6. **Firewall Drop**: `mcp_wazuh_wazuh_firewall_drop`
-   - Params: agent_id, source IP
-   - Verify: `mcp_wazuh_wazuh_check_blocked_ip`
+5. **Not configured yet**
+   - Host isolation, process kill, and file quarantine are approval-required but blocked until tested scripts are installed on the manager/agent. Explain this instead of attempting them.
 
 ALWAYS verify after execution. If verification fails, report immediately.
 
@@ -158,16 +156,16 @@ After containment:
 
 | Action | Policy | Tool |
 |--------|--------|------|
-| Block IP | ✅ Approval required | `wazuh_block_ip` |
-| Isolate host | ✅ Approval required | `wazuh_isolate_host` |
-| Kill process | ✅ Approval required | `wazuh_kill_process` |
-| Disable user | ✅ Approval required | `wazuh_disable_user` |
-| Quarantine file | ✅ Approval required | `wazuh_quarantine_file` |
-| Firewall drop | ✅ Approval required | `wazuh_firewall_drop` |
-| Host deny | ✅ Approval required | `wazuh_host_deny` |
-| Restart Wazuh | 🚫 FORBIDDEN | — |
-| Modify rules | 🚫 FORBIDDEN | — |
-| Delete logs | 🚫 FORBIDDEN | — |
+| Block IP | Approval required, Linux-only until Windows rollback is implemented | `wazuh_block_ip` |
+| Firewall drop | Approval required, Linux-only until Windows rollback is implemented | `wazuh_firewall_drop` |
+| Host deny | Approval required, Linux-only | `wazuh_host_deny` |
+| Disable user | Approval required, Linux-only in current deployment | `wazuh_disable_user` |
+| Isolate host | Approval required but not configured yet | `wazuh_isolate_host` |
+| Kill process | Approval required but not configured yet | `wazuh_kill_process` |
+| Quarantine file | Approval required but not configured yet | `wazuh_quarantine_file` |
+| Restart Wazuh | FORBIDDEN | - |
+| Modify rules | FORBIDDEN | - |
+| Delete logs | FORBIDDEN | - |
 
 ## Pitfalls
 

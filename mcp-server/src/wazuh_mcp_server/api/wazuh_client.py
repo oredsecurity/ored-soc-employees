@@ -943,6 +943,20 @@ class WazuhClient:
     # Active Response / Action Tools
     # =========================================================================
 
+    # Supported active-response commands by endpoint OS. Commands not listed here
+    # are intentionally blocked until their scripts are installed and tested.
+    ACTIVE_RESPONSE_COMMAND_SUPPORT = {
+        "!firewall-drop": frozenset({"linux"}),
+        "!host-deny": frozenset({"linux"}),
+        "!route-null": frozenset({"linux"}),
+        "!disable-account": frozenset({"linux"}),
+        "!enable-account": frozenset({"linux"}),
+    }
+    ALLOWED_AR_COMMANDS = frozenset(ACTIVE_RESPONSE_COMMAND_SUPPORT)
+    FORBIDDEN_AR_COMMANDS = frozenset({"!restart-wazuh"})
+    WINDOWS_PLATFORMS = frozenset({"windows", "win32", "win64"})
+    LINUX_PLATFORMS = frozenset({"linux", "ubuntu", "debian", "rhel", "centos", "rocky", "almalinux", "amzn", "sles", "kali"})
+
     @staticmethod
     def _sanitize_ar_argument(value: str, param_name: str) -> str:
         """Sanitize active response argument to prevent command injection.
@@ -979,101 +993,203 @@ class WazuhClient:
             return ip_address
         raise ValueError(f"Invalid IP address format for {param_name}: {ip_address}")
 
-    async def block_ip(self, ip_address: str, duration: int = 0, agent_id: str = None) -> Dict[str, Any]:
-        """Block IP via firewall-drop active response."""
-        ip_address = self._validate_ip(ip_address)
-        ip_address = self._sanitize_ar_argument(ip_address, "ip_address")
+    @classmethod
+    def _normalize_agent_platform(cls, os_info: Dict[str, Any]) -> str:
+        platform = str(os_info.get("platform") or "").lower()
+        name = str(os_info.get("name") or "").lower()
+        haystack = f"{platform} {name}"
+        if any(token in haystack for token in cls.WINDOWS_PLATFORMS):
+            return "windows"
+        if any(token in haystack for token in cls.LINUX_PLATFORMS):
+            return "linux"
+        return "unknown"
+
+    async def get_agent_os_context(self, agent_id: str) -> Dict[str, Any]:
+        """Return the agent status and normalized OS platform used for response decisions."""
+        if not agent_id or str(agent_id).lower() == "all":
+            raise ValueError("A specific agent_id is required for active response")
+        result = await self.get_agents(
+            agent_id=str(agent_id),
+            limit=1,
+            select="id,name,status,os.name,os.platform,os.version,ip,lastKeepAlive",
+        )
+        agents = result.get("data", {}).get("affected_items", [])
+        if not agents:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent = agents[0]
+        os_info = agent.get("os") or {}
+        normalized_platform = self._normalize_agent_platform(os_info)
+        return {
+            "agent_id": str(agent.get("id") or agent_id),
+            "agent_name": agent.get("name"),
+            "agent_status": agent.get("status"),
+            "agent_ip": agent.get("ip"),
+            "last_keepalive": agent.get("lastKeepAlive"),
+            "os_detected": normalized_platform,
+            "os_name": os_info.get("name"),
+            "os_platform": os_info.get("platform"),
+            "os_version": os_info.get("version"),
+        }
+
+    async def _require_active_response_target(
+        self,
+        agent_id: str,
+        action: str,
+        allowed_platforms: frozenset[str],
+    ) -> Dict[str, Any]:
+        """Fail closed unless the target agent is active and its OS supports the action."""
+        if not agent_id or str(agent_id).lower() == "all":
+            raise ValueError(f"Refusing {action}: a specific active agent_id is required")
+        context = await self.get_agent_os_context(agent_id)
+        status = str(context.get("agent_status") or "unknown").lower()
+        platform = context.get("os_detected") or "unknown"
+        if status != "active":
+            raise ValueError(
+                f"Refusing {action} on agent {agent_id}: agent status is '{context.get('agent_status')}', not 'active'"
+            )
+        if platform == "unknown":
+            raise ValueError(
+                f"Refusing {action} on agent {agent_id}: unable to determine endpoint OS from Wazuh metadata"
+            )
+        if platform not in allowed_platforms:
+            allowed = ", ".join(sorted(allowed_platforms)) or "none"
+            raise ValueError(
+                f"Refusing {action} on agent {agent_id}: OS '{platform}' is not supported for this action; "
+                f"supported OS: {allowed}"
+            )
+        return context
+
+    @staticmethod
+    def _attach_response_context(
+        result: Dict[str, Any],
+        context: Dict[str, Any],
+        action: str,
+        command: str,
+    ) -> Dict[str, Any]:
+        data = result.setdefault("data", {})
+        data["ored_response_guard"] = {
+            "action": action,
+            "agent_id": context.get("agent_id"),
+            "agent_name": context.get("agent_name"),
+            "agent_status": context.get("agent_status"),
+            "os_detected": context.get("os_detected"),
+            "os_name": context.get("os_name"),
+            "os_platform": context.get("os_platform"),
+            "os_version": context.get("os_version"),
+            "command_selected": command,
+        }
+        return result
+
+    @staticmethod
+    def _ip_response_arguments(ip_address: str, duration: int = 0, delete: bool = False) -> list[str]:
         arguments = [f"-srcip {ip_address}"]
         if duration and duration > 0:
             arguments.append(f"-timeout {int(duration)}")
+        if delete:
+            arguments.append("delete")
+        return arguments
+
+    @staticmethod
+    def _command_for_ip_block(platform: str) -> str:
+        if platform != "linux":
+            raise ValueError("IP blocking is enabled only for Linux endpoints until Windows netsh rollback is implemented")
+        return "!firewall-drop"
+
+    async def block_ip(self, ip_address: str, duration: int = 0, agent_id: str = None) -> Dict[str, Any]:
+        """Block IP with an OS-compatible active response command."""
+        ip_address = self._validate_ip(ip_address)
+        ip_address = self._sanitize_ar_argument(ip_address, "ip_address")
+        context = await self._require_active_response_target(agent_id, "block_ip", frozenset({"linux"}))
+        command = self._command_for_ip_block(context["os_detected"])
         data = {
-            "command": "!firewall-drop",
-            "agent_list": [agent_id] if agent_id else ["all"],
-            "arguments": arguments,
+            "command": command,
+            "agent_list": [agent_id],
+            "arguments": self._ip_response_arguments(ip_address, duration),
             "alert": {"data": {"srcip": ip_address}},
         }
-        return await self.execute_active_response(data)
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "block_ip", command)
 
     async def isolate_host(self, agent_id: str) -> Dict[str, Any]:
-        """Isolate host from network via active response."""
-        if not agent_id:
-            raise ValueError("agent_id is required for host isolation")
-        data = {"command": "!host-isolation", "agent_list": [agent_id], "arguments": []}
-        return await self.execute_active_response(data)
+        """Fail closed until a tested host-isolation script is installed."""
+        await self._require_active_response_target(agent_id, "host isolation", frozenset({"linux", "windows"}))
+        raise ValueError("Host isolation active response is not configured in this deployment")
 
     async def kill_process(self, agent_id: str, process_id: int) -> Dict[str, Any]:
-        """Kill process on agent via active response."""
-        if not agent_id:
-            raise ValueError("agent_id is required for kill_process")
-        try:
-            pid = int(process_id)
-        except (ValueError, TypeError):
-            raise ValueError(f"process_id must be numeric, got: {process_id}")
-        data = {"command": "!kill-process", "agent_list": [agent_id], "arguments": [str(pid)]}
-        return await self.execute_active_response(data)
+        """Fail closed until a tested process-kill script is installed."""
+        if process_id is None:
+            raise ValueError("process_id is required for kill_process")
+        await self._require_active_response_target(agent_id, "kill_process", frozenset({"linux", "windows"}))
+        raise ValueError("Process kill active response is not configured in this deployment")
 
     async def disable_user(self, agent_id: str, username: str) -> Dict[str, Any]:
-        """Disable user account on agent via active response."""
-        if not agent_id:
-            raise ValueError("agent_id is required for disable_user")
+        """Disable a user account when the deployment has a supported script for that OS."""
         username = self._sanitize_ar_argument(username, "username")
-        data = {"command": "!disable-account", "agent_list": [agent_id], "arguments": [username]}
-        return await self.execute_active_response(data)
+        context = await self._require_active_response_target(agent_id, "disable_user", frozenset({"linux"}))
+        command = "!disable-account"
+        data = {"command": command, "agent_list": [agent_id], "arguments": [username]}
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "disable_user", command)
 
     async def quarantine_file(self, agent_id: str, file_path: str) -> Dict[str, Any]:
-        """Quarantine file on agent via active response."""
-        if not agent_id:
-            raise ValueError("agent_id is required for quarantine_file")
+        """Fail closed until a tested quarantine script is installed."""
         file_path = self._sanitize_ar_argument(file_path, "file_path")
-        data = {"command": "!quarantine", "agent_list": [agent_id], "arguments": [file_path]}
-        return await self.execute_active_response(data)
-
-    # Known Wazuh active response commands (with ! prefix for stateful execution)
-    ALLOWED_AR_COMMANDS = frozenset([
-        "!firewall-drop", "!host-isolation", "!kill-process",
-        "!disable-account", "!enable-account", "!quarantine",
-        "!host-deny", "!restart-wazuh",
-    ])
+        await self._require_active_response_target(agent_id, "quarantine_file", frozenset({"linux", "windows"}))
+        raise ValueError("File quarantine active response is not configured in this deployment")
 
     async def run_active_response(self, agent_id: str, command: str, parameters: dict = None) -> Dict[str, Any]:
-        """Execute generic active response command."""
+        """Execute a generic active response command after OS compatibility checks."""
+        command = str(command or "").strip()
+        if command and not command.startswith("!"):
+            command = f"!{command}"
+        if command in self.FORBIDDEN_AR_COMMANDS:
+            raise ValueError(f"Forbidden active response command: {command}")
         if command not in self.ALLOWED_AR_COMMANDS:
             raise ValueError(
                 f"Unknown active response command: {command}. "
                 f"Allowed commands: {', '.join(sorted(self.ALLOWED_AR_COMMANDS))}"
             )
+        context = await self._require_active_response_target(
+            agent_id,
+            f"active response {command}",
+            self.ACTIVE_RESPONSE_COMMAND_SUPPORT[command],
+        )
         args = []
         if parameters:
             args = [self._sanitize_ar_argument(f"{k}={v}", f"parameter:{k}") for k, v in parameters.items()]
         data = {"command": command, "agent_list": [agent_id], "arguments": args}
-        return await self.execute_active_response(data)
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "active_response", command)
 
     async def firewall_drop(self, agent_id: str, src_ip: str, duration: int = 0) -> Dict[str, Any]:
-        """Add firewall drop rule via active response."""
+        """Block an IP using the endpoint's OS-compatible firewall active response."""
         src_ip = self._validate_ip(src_ip, "src_ip")
         src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
-        arguments = [f"-srcip {src_ip}"]
-        if duration and duration > 0:
-            arguments.append(f"-timeout {int(duration)}")
+        context = await self._require_active_response_target(agent_id, "firewall_drop", frozenset({"linux"}))
+        command = self._command_for_ip_block(context["os_detected"])
         data = {
-            "command": "!firewall-drop",
+            "command": command,
             "agent_list": [agent_id],
-            "arguments": arguments,
+            "arguments": self._ip_response_arguments(src_ip, duration),
             "alert": {"data": {"srcip": src_ip}},
         }
-        return await self.execute_active_response(data)
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "firewall_drop", command)
 
     async def host_deny(self, agent_id: str, src_ip: str) -> Dict[str, Any]:
-        """Add hosts.deny entry via active response."""
+        """Add hosts.deny entry via Linux-only active response."""
         src_ip = self._validate_ip(src_ip, "src_ip")
         src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        context = await self._require_active_response_target(agent_id, "host_deny", frozenset({"linux"}))
+        command = "!host-deny"
         data = {
-            "command": "!host-deny",
+            "command": command,
             "agent_list": [agent_id],
             "arguments": [f"-srcip {src_ip}"],
             "alert": {"data": {"srcip": src_ip}},
         }
-        return await self.execute_active_response(data)
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "host_deny", command)
 
     async def restart_service(self, target: str) -> Dict[str, Any]:
         """Restart Wazuh agent or manager."""
@@ -1091,7 +1207,12 @@ class WazuhClient:
             raise IndexerNotConfiguredError()
         result = await self._indexer_client.get_alerts(limit=50)
         alerts = result.get("data", {}).get("affected_items", [])
-        matches = [a for a in alerts if _dict_contains_text(a, ip_address) and _dict_contains_text(a, "firewall-drop")]
+        matches = [
+            a
+            for a in alerts
+            if _dict_contains_text(a, ip_address)
+            and (_dict_contains_text(a, "firewall-drop") or _dict_contains_text(a, "netsh"))
+        ]
         return {"data": {"ip_address": ip_address, "blocked": len(matches) > 0, "matching_alerts": len(matches)}}
 
     async def check_agent_isolation(self, agent_id: str) -> Dict[str, Any]:
@@ -1174,41 +1295,54 @@ class WazuhClient:
     # =========================================================================
 
     async def unisolate_host(self, agent_id: str) -> Dict[str, Any]:
-        """Remove host isolation via active response."""
-        data = {"command": "!host-isolation", "agent_list": [agent_id], "arguments": ["undo"]}
-        return await self.execute_active_response(data)
+        """Fail closed until a tested host-isolation script is installed."""
+        await self._require_active_response_target(agent_id, "unisolate_host", frozenset({"linux", "windows"}))
+        raise ValueError("Host isolation rollback is not configured in this deployment")
 
     async def enable_user(self, agent_id: str, username: str) -> Dict[str, Any]:
-        """Re-enable user account via active response."""
+        """Re-enable a user account when the deployment has a supported script for that OS."""
         username = self._sanitize_ar_argument(username, "username")
-        data = {"command": "!enable-account", "agent_list": [agent_id], "arguments": [username]}
-        return await self.execute_active_response(data)
+        context = await self._require_active_response_target(agent_id, "enable_user", frozenset({"linux"}))
+        command = "!enable-account"
+        data = {"command": command, "agent_list": [agent_id], "arguments": [username]}
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "enable_user", command)
 
     async def restore_file(self, agent_id: str, file_path: str) -> Dict[str, Any]:
-        """Restore a quarantined file via active response."""
+        """Fail closed until a tested quarantine script is installed."""
         file_path = self._sanitize_ar_argument(file_path, "file_path")
-        data = {"command": "!quarantine", "agent_list": [agent_id], "arguments": ["restore", file_path]}
-        return await self.execute_active_response(data)
+        await self._require_active_response_target(agent_id, "restore_file", frozenset({"linux", "windows"}))
+        raise ValueError("File quarantine rollback is not configured in this deployment")
 
     async def firewall_allow(self, agent_id: str, src_ip: str) -> Dict[str, Any]:
-        """Remove firewall drop rule via active response."""
+        """Remove an IP firewall active response using the endpoint's OS-compatible command."""
+        src_ip = self._validate_ip(src_ip, "src_ip")
         src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        context = await self._require_active_response_target(agent_id, "firewall_allow", frozenset({"linux"}))
+        command = self._command_for_ip_block(context["os_detected"])
         data = {
-            "command": "!firewall-drop",
+            "command": command,
             "agent_list": [agent_id],
-            "arguments": [f"-srcip {src_ip}", "delete"],
+            "arguments": self._ip_response_arguments(src_ip, delete=True),
+            "alert": {"data": {"srcip": src_ip}},
         }
-        return await self.execute_active_response(data)
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "firewall_allow", command)
 
     async def host_allow(self, agent_id: str, src_ip: str) -> Dict[str, Any]:
-        """Remove hosts.deny entry via active response."""
+        """Remove hosts.deny entry via Linux-only active response."""
+        src_ip = self._validate_ip(src_ip, "src_ip")
         src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
+        context = await self._require_active_response_target(agent_id, "host_allow", frozenset({"linux"}))
+        command = "!host-deny"
         data = {
-            "command": "!host-deny",
+            "command": command,
             "agent_list": [agent_id],
-            "arguments": [f"-srcip {src_ip}", "delete"],
+            "arguments": self._ip_response_arguments(src_ip, delete=True),
+            "alert": {"data": {"srcip": src_ip}},
         }
-        return await self.execute_active_response(data)
+        result = await self.execute_active_response(data)
+        return self._attach_response_context(result, context, "host_allow", command)
 
     async def close(self):
         """Close the HTTP client and indexer client."""

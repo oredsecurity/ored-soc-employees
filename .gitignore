@@ -9,3 +9,4 @@ hermes-data/
 .hermes/
 docs/internal/
 upstream-pr/
+scripts/active-response/windows/ored-win-firewall.exe

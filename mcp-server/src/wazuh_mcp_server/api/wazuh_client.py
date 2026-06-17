@@ -1081,7 +1081,16 @@ class WazuhClient:
         return result
 
     @staticmethod
-    def _ip_response_arguments(ip_address: str, duration: int = 0, delete: bool = False) -> list[str]:
+    def _ip_response_arguments(
+        ip_address: str,
+        duration: int = 0,
+        delete: bool = False,
+        platform: str = "linux",
+    ) -> list[str]:
+        if platform == "windows":
+            if duration and duration > 0:
+                raise ValueError("Windows firewall wrapper does not support timed auto-rollback; use firewall_allow")
+            return [f"srcip={ip_address}"]
         arguments = [f"-srcip {ip_address}"]
         if duration and duration > 0:
             arguments.append(f"-timeout {int(duration)}")
@@ -1091,20 +1100,26 @@ class WazuhClient:
 
     @staticmethod
     def _command_for_ip_block(platform: str) -> str:
-        if platform != "linux":
-            raise ValueError("IP blocking is enabled only for Linux endpoints until Windows custom dispatch is validated")
+        if platform == "windows":
+            return "!ored-win-firewall-v3"
+        return "!firewall-drop"
+
+    @staticmethod
+    def _command_for_ip_allow(platform: str) -> str:
+        if platform == "windows":
+            return "!ored-win-firewall-rollback"
         return "!firewall-drop"
 
     async def block_ip(self, ip_address: str, duration: int = 0, agent_id: str = None) -> Dict[str, Any]:
         """Block IP with an OS-compatible active response command."""
         ip_address = self._validate_ip(ip_address)
         ip_address = self._sanitize_ar_argument(ip_address, "ip_address")
-        context = await self._require_active_response_target(agent_id, "block_ip", frozenset({"linux"}))
+        context = await self._require_active_response_target(agent_id, "block_ip", frozenset({"linux", "windows"}))
         command = self._command_for_ip_block(context["os_detected"])
         data = {
             "command": command,
             "agent_list": [agent_id],
-            "arguments": self._ip_response_arguments(ip_address, duration),
+            "arguments": self._ip_response_arguments(ip_address, duration, platform=context["os_detected"]),
             "alert": {"data": {"srcip": ip_address}},
         }
         result = await self.execute_active_response(data)
@@ -1165,12 +1180,12 @@ class WazuhClient:
         """Block an IP using the endpoint's OS-compatible firewall active response."""
         src_ip = self._validate_ip(src_ip, "src_ip")
         src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
-        context = await self._require_active_response_target(agent_id, "firewall_drop", frozenset({"linux"}))
+        context = await self._require_active_response_target(agent_id, "firewall_drop", frozenset({"linux", "windows"}))
         command = self._command_for_ip_block(context["os_detected"])
         data = {
             "command": command,
             "agent_list": [agent_id],
-            "arguments": self._ip_response_arguments(src_ip, duration),
+            "arguments": self._ip_response_arguments(src_ip, duration, platform=context["os_detected"]),
             "alert": {"data": {"srcip": src_ip}},
         }
         result = await self.execute_active_response(data)
@@ -1207,11 +1222,17 @@ class WazuhClient:
             raise IndexerNotConfiguredError()
         result = await self._indexer_client.get_alerts(limit=50)
         alerts = result.get("data", {}).get("affected_items", [])
+        response_terms = (
+            "firewall-drop",
+            "netsh",
+            "ored-win-firewall",
+            "ORED ARGOS BLOCKED IP",
+        )
         matches = [
             a
             for a in alerts
             if _dict_contains_text(a, ip_address)
-            and (_dict_contains_text(a, "firewall-drop") or _dict_contains_text(a, "netsh"))
+            and any(_dict_contains_text(a, term) for term in response_terms)
         ]
         return {"data": {"ip_address": ip_address, "blocked": len(matches) > 0, "matching_alerts": len(matches)}}
 
@@ -1318,12 +1339,12 @@ class WazuhClient:
         """Remove an IP firewall active response using the endpoint's OS-compatible command."""
         src_ip = self._validate_ip(src_ip, "src_ip")
         src_ip = self._sanitize_ar_argument(src_ip, "src_ip")
-        context = await self._require_active_response_target(agent_id, "firewall_allow", frozenset({"linux"}))
-        command = self._command_for_ip_block(context["os_detected"])
+        context = await self._require_active_response_target(agent_id, "firewall_allow", frozenset({"linux", "windows"}))
+        command = self._command_for_ip_allow(context["os_detected"])
         data = {
             "command": command,
             "agent_list": [agent_id],
-            "arguments": self._ip_response_arguments(src_ip, delete=True),
+            "arguments": self._ip_response_arguments(src_ip, delete=True, platform=context["os_detected"]),
             "alert": {"data": {"srcip": src_ip}},
         }
         result = await self.execute_active_response(data)
@@ -1338,7 +1359,7 @@ class WazuhClient:
         data = {
             "command": command,
             "agent_list": [agent_id],
-            "arguments": self._ip_response_arguments(src_ip, delete=True),
+            "arguments": self._ip_response_arguments(src_ip, delete=True, platform=context["os_detected"]),
             "alert": {"data": {"srcip": src_ip}},
         }
         result = await self.execute_active_response(data)

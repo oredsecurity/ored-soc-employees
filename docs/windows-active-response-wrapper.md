@@ -83,6 +83,34 @@ Windows containment can be enabled through the high-level guarded ARGOS tools on
 
 ## Final June 17 Note
 
-A later cleanup pass tested separate `block`/`unblock` command names and then removed all experimental manager registrations. This improved command clarity but did not make rollback reliable enough to trust.
+The first rollback attempts were not reliable because the wrapper did not yet implement Wazuh's custom active-response stdin/stdout protocol. After adding the protocol handshake, separate add/delete command names, and action-specific keys, the wrapper passed live block and rollback validation on `001 / ored-win-01`.
 
-Current product behavior must stay unchanged: Windows firewall containment is blocked in ARGOS. The wrapper files are experimental artifacts only until a future test proves both block and rollback repeatedly through Wazuh API, with endpoint firewall evidence and no hung wrapper processes.
+Current product behavior: Windows firewall containment is allowed only through ARGOS high-level guarded tools after human approval. Generic raw `netsh` and arbitrary Windows active-response commands remain blocked.
+
+### Deployed MCP Verification
+
+After rebuilding and restarting `wazuh-mcp-server` and `hermes-agent` on AgentInstance, the high-level MCP client path was verified with `203.0.113.81`:
+
+- `WazuhClient.firewall_drop("001", "203.0.113.81")` selected `!ored-win-firewall-v3` for Windows.
+- `WazuhClient.firewall_allow("001", "203.0.113.81")` selected `!ored-win-firewall-rollback` for Windows.
+- Endpoint log confirmed `add srcip=203.0.113.81 rc=0`.
+- Endpoint log confirmed `delete srcip=203.0.113.81 rc=0`.
+- Final endpoint firewall check showed no remaining `ORED ARGOS BLOCKED IP` rule.
+
+## Verified Live Deployment
+
+June 17 follow-up verification confirmed the full deployed path, not only direct API dispatch:
+
+- WazuhInstance manager config was updated and restarted successfully.
+- Generated manager `ar.conf` includes both wrapper commands:
+
+```text
+ored-win-firewall-v30 - ored-win-firewall-v3.exe - 0
+ored-win-firewall-rollback0 - ored-win-firewall-rollback.exe - 0
+```
+
+- The endpoint wrapper binaries match the repo-built `scripts/active-response/windows/ored-win-firewall.exe` SHA256: `3ed677d16f368e2720a53bac0df977542f84b2afa85547b41257ff93b874cc9c`.
+- `WazuhConfig` accepts `WAZUH_VERIFY_SSL=false`, which matches the AgentInstance `.env` and prevents self-signed Wazuh API certificate failures.
+- Direct Wazuh API validation with `203.0.113.82` completed add/delete with endpoint `rc=0` evidence.
+- High-level MCP client validation with `203.0.113.83` completed add/delete through `WazuhClient.firewall_drop` and `WazuhClient.firewall_allow` with endpoint `rc=0` evidence.
+- Final endpoint state had no `ORED ARGOS BLOCKED IP` rules and no stuck wrapper processes.
